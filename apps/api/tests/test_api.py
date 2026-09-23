@@ -1,3 +1,4 @@
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -15,6 +16,7 @@ from app.jobs import (
     fail_job,
     promote_due_retries,
     recover_expired_leases,
+    renew_lease,
     retry_delay_seconds,
 )
 from app.main import ADMIN_PASSWORD, ADMIN_USER, app
@@ -132,8 +134,8 @@ def test_health() -> None:
 def test_root_version() -> None:
     response = client.get("/")
     assert response.status_code == 200
-    assert response.json()["version"] == "0.7.0"
-    assert response.json()["status"] == "unified-dashboard"
+    assert response.json()["version"] == "0.8.0"
+    assert response.json()["status"] == "reliability-hardened"
 
 
 def test_control_plane_requires_authentication() -> None:
@@ -1208,3 +1210,240 @@ def test_security_headers_are_present() -> None:
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["x-frame-options"] == "DENY"
     assert response.headers["referrer-policy"] == "no-referrer"
+
+
+
+def test_claim_refreshes_lease_after_attempt_persistence_stall() -> None:
+    project_id, event_id = create_event()
+    kind = f"TEST_CLAIM_STALL_{uuid.uuid4().hex}"
+    job_id = insert_test_job(project_id, event_id, kind)
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE OR REPLACE FUNCTION eventforge_test_delay_job_attempt()
+                RETURNS trigger
+                LANGUAGE plpgsql
+                AS $$
+                BEGIN
+                    IF NEW.worker_id = 'worker-claim-stall' THEN
+                        PERFORM pg_sleep(2.2);
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$
+                """
+            )
+            cur.execute(
+                "DROP TRIGGER IF EXISTS eventforge_test_delay_job_attempt_trigger ON job_attempts"
+            )
+            cur.execute(
+                """
+                CREATE TRIGGER eventforge_test_delay_job_attempt_trigger
+                BEFORE INSERT ON job_attempts
+                FOR EACH ROW
+                EXECUTE FUNCTION eventforge_test_delay_job_attempt()
+                """
+            )
+
+    try:
+        claimed = claim_job(
+            "worker-claim-stall",
+            kinds=(kind,),
+            lease_seconds=2,
+        )
+        assert claimed is not None
+
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT status,
+                           EXTRACT(EPOCH FROM (lease_expires_at - clock_timestamp())) AS lease_remaining
+                    FROM jobs
+                    WHERE id = %s
+                    """,
+                    (job_id,),
+                )
+                row = cur.fetchone()
+
+        assert row is not None
+        assert row["status"] == "RUNNING"
+        assert float(row["lease_remaining"]) > 1.0
+
+        complete_job(claimed["id"], claimed["lease_token"])
+    finally:
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DROP TRIGGER IF EXISTS eventforge_test_delay_job_attempt_trigger ON job_attempts"
+                )
+                cur.execute("DROP FUNCTION IF EXISTS eventforge_test_delay_job_attempt()")
+
+
+def test_lease_heartbeat_extends_expiry_and_is_exposed_by_job_api() -> None:
+    project_id, event_id = create_event()
+    kind = f"TEST_HEARTBEAT_{uuid.uuid4().hex}"
+    job_id = insert_test_job(project_id, event_id, kind)
+
+    claimed = claim_job("worker-heartbeat", kinds=(kind,), lease_seconds=5)
+    assert claimed is not None
+    before = get_job_row(job_id)
+    assert before["last_heartbeat_at"] is not None
+
+    assert renew_lease(claimed["id"], claimed["lease_token"], lease_seconds=30) is True
+    after = get_job_row(job_id)
+    assert after["lease_expires_at"] > before["lease_expires_at"]
+    assert after["last_heartbeat_at"] >= before["last_heartbeat_at"]
+
+    api_job = client.get(f"/jobs/{job_id}", auth=ADMIN_AUTH)
+    assert api_job.status_code == 200
+    assert api_job.json()["last_heartbeat_at"] is not None
+    assert api_job.json()["recovery_count"] == 0
+
+    complete_job(claimed["id"], claimed["lease_token"])
+
+
+def test_expired_lease_recovery_records_recovery_metadata() -> None:
+    project_id, event_id = create_event()
+    kind = f"TEST_RECOVERY_META_{uuid.uuid4().hex}"
+    job_id = insert_test_job(project_id, event_id, kind, max_attempts=3)
+    claimed = claim_job("worker-recovery-meta", kinds=(kind,), lease_seconds=30)
+    assert claimed is not None
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE jobs SET lease_expires_at = now() - interval '1 second' WHERE id = %s",
+                (job_id,),
+            )
+
+    result = recover_expired_leases()
+    assert result["requeued"] >= 1
+    recovered = get_job_row(job_id)
+    assert recovered["recovery_count"] == 1
+    assert recovered["last_recovered_at"] is not None
+    assert recovered["status"] in {"RETRY_WAIT", "PENDING"}
+
+
+def test_queue_health_reports_live_and_recovered_queue_state() -> None:
+    project_id, event_id = create_event()
+    kind = f"TEST_QUEUE_HEALTH_{uuid.uuid4().hex}"
+    job_id = insert_test_job(project_id, event_id, kind)
+    claimed = claim_job("worker-queue-health", kinds=(kind,), lease_seconds=30)
+    assert claimed is not None
+
+    running = client.get(f"/projects/{project_id}/queue-health", auth=ADMIN_AUTH)
+    assert running.status_code == 200
+    body = running.json()
+    assert body["project_id"] == project_id
+    assert body["running"] >= 1
+    assert body["expired_leases"] == 0
+    assert body["latest_running_heartbeat_at"] is not None
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE jobs SET lease_expires_at = now() - interval '1 second' WHERE id = %s",
+                (job_id,),
+            )
+    recover_expired_leases()
+
+    recovered = client.get(f"/projects/{project_id}/queue-health", auth=ADMIN_AUTH).json()
+    assert recovered["recovered_jobs"] >= 1
+    assert recovered["total_recoveries"] >= 1
+    assert recovered["last_recovered_at"] is not None
+
+
+def test_queue_health_remains_project_scoped_for_api_keys() -> None:
+    suffix = uuid.uuid4().hex
+    project_a = client.post("/projects", auth=ADMIN_AUTH, json={"name": f"queue-a-{suffix}"}).json()
+    project_b = client.post("/projects", auth=ADMIN_AUTH, json={"name": f"queue-b-{suffix}"}).json()
+    key = client.post(
+        f"/projects/{project_a['id']}/api-keys",
+        auth=ADMIN_AUTH,
+        json={"name": "queue-health"},
+    ).json()["api_key"]
+    bearer = {"Authorization": f"Bearer {key}"}
+
+    assert client.get(f"/projects/{project_a['id']}/queue-health", headers=bearer).status_code == 200
+    assert client.get(f"/projects/{project_b['id']}/queue-health", headers=bearer).status_code == 404
+    assert client.post("/operations/recover-jobs", headers=bearer).status_code == 404
+
+
+def test_admin_recovery_endpoint_recovers_expired_job() -> None:
+    project_id, event_id = create_event()
+    kind = f"TEST_ADMIN_RECOVERY_{uuid.uuid4().hex}"
+    job_id = insert_test_job(project_id, event_id, kind)
+    claimed = claim_job("worker-admin-recovery", kinds=(kind,), lease_seconds=30)
+    assert claimed is not None
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE jobs SET lease_expires_at = now() - interval '1 second' WHERE id = %s",
+                (job_id,),
+            )
+
+    assert client.post("/operations/recover-jobs").status_code == 401
+    response = client.post("/operations/recover-jobs", auth=ADMIN_AUTH)
+    assert response.status_code == 200
+    assert response.json()["expired_requeued"] >= 1
+    job = get_job_row(job_id)
+    assert job["status"] == "PENDING"
+    assert job["recovery_count"] == 1
+
+
+def test_concurrent_duplicate_ingest_creates_one_event_and_one_process_job() -> None:
+    suffix = uuid.uuid4().hex
+    project = client.post(
+        "/projects", auth=ADMIN_AUTH, json={"name": f"concurrent-ingest-{suffix}"}
+    ).json()
+    endpoint = client.post(
+        f"/projects/{project['id']}/webhook-endpoints",
+        auth=ADMIN_AUTH,
+        json={"name": f"concurrent-{suffix}", "source": "generic"},
+    ).json()
+    delivery_id = f"concurrent-{suffix}"
+
+    def send_one(index: int) -> tuple[int, dict]:
+        with TestClient(app) as parallel_client:
+            response = parallel_client.post(
+                "/ingest",
+                headers={
+                    "X-EventForge-Endpoint-Token": endpoint["endpoint_token"],
+                    "X-EventForge-Delivery-ID": delivery_id,
+                    "X-EventForge-Event-Type": "reliability.concurrent",
+                },
+                json={"index": index},
+            )
+            return response.status_code, response.json()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(send_one, range(8)))
+
+    assert all(code == 202 for code, _ in results)
+    bodies = [body for _, body in results]
+    assert len({body["event_id"] for body in bodies}) == 1
+    assert sum(body["duplicate"] is False for body in bodies) == 1
+    assert sum(body["duplicate"] is True for body in bodies) == 7
+
+    event_id = bodies[0]["event_id"]
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) AS count FROM events WHERE endpoint_id = %s AND provider_delivery_id = %s",
+                (endpoint["id"], delivery_id),
+            )
+            assert cur.fetchone()["count"] == 1
+            cur.execute(
+                "SELECT count(*) AS count FROM jobs WHERE event_id = %s AND kind = 'PROCESS_EVENT'",
+                (event_id,),
+            )
+            assert cur.fetchone()["count"] == 1
+            cur.execute(
+                "SELECT count(*) AS count FROM ingress_attempts WHERE endpoint_id = %s AND provider_delivery_id = %s",
+                (endpoint["id"], delivery_id),
+            )
+            assert cur.fetchone()["count"] == 8

@@ -9,6 +9,7 @@ import {
   type JobRow,
   type Project,
   type ProjectSummary,
+  type QueueHealth,
   type ReplayRow,
   type StepRun,
   type WorkflowRow,
@@ -235,6 +236,7 @@ function Overview({ auth, projectId }: { auth: AuthState; projectId: string }) {
   const [replays, setReplays] = React.useState<ReplayRow[]>([]);
   const [workflows, setWorkflows] = React.useState<WorkflowRow[]>([]);
   const [runs, setRuns] = React.useState<WorkflowRun[]>([]);
+  const [queueHealth, setQueueHealth] = React.useState<QueueHealth | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(true);
 
@@ -242,13 +244,14 @@ function Overview({ auth, projectId }: { auth: AuthState; projectId: string }) {
     setLoading(true);
     setError(null);
     try {
-      const [summaryValue, eventValue, jobValue, replayValue, workflowValue, runValue] = await Promise.all([
+      const [summaryValue, eventValue, jobValue, replayValue, workflowValue, runValue, queueHealthValue] = await Promise.all([
         apiRequest<ProjectSummary>(auth, `/projects/${projectId}/summary`),
         apiRequest<EventRow[]>(auth, `/projects/${projectId}/events?limit=8`),
         apiRequest<JobRow[]>(auth, `/projects/${projectId}/jobs?limit=8`),
         apiRequest<ReplayRow[]>(auth, `/projects/${projectId}/replays?limit=8`),
         apiRequest<WorkflowRow[]>(auth, `/projects/${projectId}/workflows`),
         apiRequest<WorkflowRun[]>(auth, `/projects/${projectId}/workflow-runs?limit=8`),
+        apiRequest<QueueHealth>(auth, `/projects/${projectId}/queue-health`),
       ]);
       setSummary(summaryValue);
       setEvents(eventValue);
@@ -256,6 +259,7 @@ function Overview({ auth, projectId }: { auth: AuthState; projectId: string }) {
       setReplays(replayValue);
       setWorkflows(workflowValue);
       setRuns(runValue);
+      setQueueHealth(queueHealthValue);
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -287,6 +291,19 @@ function Overview({ auth, projectId }: { auth: AuthState; projectId: string }) {
       {summary?.counts.dead_lettered_jobs ? (
         <div className="banner banner-error">{summary.counts.dead_lettered_jobs} job(s) are dead-lettered and require inspection.</div>
       ) : null}
+      {queueHealth?.expired_leases ? (
+        <div className="banner banner-error">{queueHealth.expired_leases} running job lease(s) are expired and await recovery.</div>
+      ) : null}
+
+      <section className="panel reliability-strip">
+        <div className="panel-title"><div><span className="kicker">RELIABILITY</span><h3>Queue recovery state</h3></div><span>{queueHealth?.total_recoveries ?? 0} recoveries</span></div>
+        <div className="reliability-grid">
+          <div><span>Running</span><strong>{queueHealth?.running ?? 0}</strong></div>
+          <div><span>Retry wait</span><strong>{queueHealth?.retry_wait ?? 0}</strong></div>
+          <div><span>Recovered jobs</span><strong>{queueHealth?.recovered_jobs ?? 0}</strong></div>
+          <div><span>Oldest actionable</span><strong>{queueHealth?.oldest_actionable_age_seconds == null ? "—" : `${Math.round(queueHealth.oldest_actionable_age_seconds)}s`}</strong></div>
+        </div>
+      </section>
 
       <div className="dashboard-grid">
         <section className="panel span-2">
@@ -847,7 +864,7 @@ export default function App() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="sidebar-brand"><div className="brand-mark small">EF</div><div><strong>EventForge</strong><span>{root?.version ?? "v0.7.0"}</span></div></div>
+        <div className="sidebar-brand"><div className="brand-mark small">EF</div><div><strong>EventForge</strong><span>{root?.version ?? "v0.8.0"}</span></div></div>
         <nav>{nav.map(([key, label, number]) => <button key={key} className={view === key ? "active" : ""} onClick={() => setView(key)}><span>{number}</span>{label}</button>)}</nav>
         <div className="sidebar-foot"><span>{auth.mode === "admin" ? "Administrator" : "Project key"}</span><button className="button button-ghost button-wide" onClick={logout}>Disconnect</button></div>
       </aside>

@@ -43,6 +43,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql://eventforge:eventforge_dev_only@db:5432/eventforge}
       EVENTFORGE_WORKER_POLL_SECONDS: ${EVENTFORGE_WORKER_POLL_SECONDS:-0.5}
       EVENTFORGE_JOB_LEASE_SECONDS: ${EVENTFORGE_JOB_LEASE_SECONDS:-30}
+      EVENTFORGE_JOB_HEARTBEAT_SECONDS: ${EVENTFORGE_JOB_HEARTBEAT_SECONDS:-10}
       EVENTFORGE_RETRY_BASE_SECONDS: ${EVENTFORGE_RETRY_BASE_SECONDS:-2}
       EVENTFORGE_RETRY_MAX_SECONDS: ${EVENTFORGE_RETRY_MAX_SECONDS:-600}
       EVENTFORGE_HTTP_ACTION_MAX_RESPONSE_BYTES: ${EVENTFORGE_HTTP_ACTION_MAX_RESPONSE_BYTES:-1048576}
@@ -80,6 +81,40 @@ services:
       db:
         condition: service_healthy
     profiles: ["test"]
+
+
+  load-probe:
+    build:
+      context: ./apps/api
+    command: ["python", "tests/load_probe.py"]
+    environment:
+      PYTHONPATH: /app
+      DATABASE_URL: ${DATABASE_URL:-postgresql://eventforge:eventforge_dev_only@db:5432/eventforge}
+      EVENTFORGE_LOAD_BASE_URL: http://api:8000
+      EVENTFORGE_ADMIN_USER: ${EVENTFORGE_ADMIN_USER:-eventforge}
+      EVENTFORGE_ADMIN_PASSWORD: ${EVENTFORGE_ADMIN_PASSWORD:-eventforge_dev_only_admin}
+      EVENTFORGE_LOAD_REQUESTS: ${EVENTFORGE_LOAD_REQUESTS:-200}
+      EVENTFORGE_LOAD_CONCURRENCY: ${EVENTFORGE_LOAD_CONCURRENCY:-20}
+      EVENTFORGE_LOAD_DUPLICATES: ${EVENTFORGE_LOAD_DUPLICATES:-20}
+    depends_on:
+      - api
+      - worker
+    profiles: ["reliability"]
+
+  recovery-probe:
+    build:
+      context: ./apps/api
+    command: ["python", "tests/recovery_probe.py"]
+    environment:
+      PYTHONPATH: /app
+      DATABASE_URL: ${DATABASE_URL:-postgresql://eventforge:eventforge_dev_only@db:5432/eventforge}
+      EVENTFORGE_RECOVERY_BASE_URL: http://api:8000
+      EVENTFORGE_ADMIN_USER: ${EVENTFORGE_ADMIN_USER:-eventforge}
+      EVENTFORGE_ADMIN_PASSWORD: ${EVENTFORGE_ADMIN_PASSWORD:-eventforge_dev_only_admin}
+    depends_on:
+      - api
+      - db
+    profiles: ["reliability"]
 
   web:
     build:

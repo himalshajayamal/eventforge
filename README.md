@@ -1,4 +1,4 @@
-# EventForge v0.7.0 — Unified Operations Dashboard
+# EventForge v0.8.0 — Reliability and Recovery Hardening
 
 EventForge v1.0 remains limited to the same three user-facing products:
 
@@ -8,97 +8,100 @@ ReplayDB    -> replay immutable historical events
 FlowTrace   -> execute durable structured workflows
 ```
 
-v0.7.0 adds the first complete browser control surface over that integrated core.
-It does **not** add a fourth product.
+v0.8.0 does **not** add a fourth product. It hardens the shared PostgreSQL job
+runtime against worker crashes, lease expiry, retry/recovery races, and
+concurrent duplicate ingress.
 
-## Unified frontend
+## Reliability additions
 
-The React/Vite application at `http://localhost:5173` now provides one project-scoped dashboard with:
+### Worker lease heartbeat
 
-```text
-Overview
-HookLedger
-  webhook endpoints
-  event ledger
-  ingress attempts
-  cross-product event integration view
-ReplayDB
-  replay creation
-  replay history
-  frozen workflow-version selections
-FlowTrace
-  workflows
-  workflow versions
-  activation
-  workflow runs
-  persisted step runs
-Security
-  project API-key creation
-  last-used/revocation status
-  revocation
-```
-
-The frontend contains no product-specific backend of its own. It calls the same
-FastAPI control plane used by automation clients.
-
-## Dashboard authentication
-
-The dashboard supports both v0.6 authentication modes:
-
-- administrator Basic authentication, which can list/create projects and manage project API keys;
-- project-scoped `efk_...` API keys, which require the project UUID and remain restricted to that project.
-
-Credentials are held only in React memory for the current page lifetime. The
-frontend does not write administrator passwords or API keys to localStorage or
-sessionStorage.
-
-One-time API keys, webhook endpoint tokens, and webhook signing secrets are
-shown in a dedicated one-time secret panel so they can be copied before the
-plaintext value is discarded.
-
-## Dashboard read projections
-
-v0.7 adds two small read-only control-plane endpoints required by the UI:
+A claimed job now records `last_heartbeat_at`. While its handler is running, the
+worker periodically renews the same lease token. Defaults:
 
 ```text
-GET /projects
-GET /projects/{project_id}/summary
+lease:      30 seconds
+heartbeat:  10 seconds
 ```
 
-`GET /projects` is administrator-only. A project API key cannot enumerate the
-global project collection.
+The interval is configurable with `EVENTFORGE_JOB_HEARTBEAT_SECONDS` and must be
+shorter than the lease duration.
 
-The project summary endpoint is project-scoped and returns counts for endpoints,
-events, jobs, pending jobs, dead-lettered jobs, replays, workflows, and workflow
-runs without requiring the browser to download every historical row.
+### Recovery audit metadata
 
-## API identity
+Jobs now retain:
 
-```json
-{"name":"EventForge","version":"0.7.0","status":"unified-dashboard"}
+```text
+recovery_count
+last_recovered_at
 ```
 
-## Local validation
+Expired leases still follow the existing attempt budget: they return to the
+retry path when attempts remain or become dead-lettered when the budget is
+exhausted.
 
-The canonical backend test command remains:
+### Queue health projection
+
+```text
+GET /projects/{project_id}/queue-health
+```
+
+returns project-scoped counts for pending, running, retry-wait, success,
+dead-lettered, expired leases, recovered jobs, total recoveries, the newest
+running heartbeat, and the age of the oldest actionable job.
+
+The v0.7 Overview dashboard now includes this reliability state.
+
+### Explicit recovery pass
+
+Administrators can trigger one bounded pass with:
+
+```text
+POST /operations/recover-jobs
+```
+
+It recovers expired leases and promotes due retries. Project API keys cannot use
+the global operations route.
+
+## Failure and load validation
+
+The canonical isolated test command is:
 
 ```bat
 docker compose run --rm --build test
 ```
 
-v0.7 contains 32 API tests, including the new dashboard project-list and project-summary boundaries.
+v0.8 contains 38 API tests. New coverage includes lease renewal, recovery audit
+metadata, queue-health authorization, administrator recovery, and eight-way
+concurrent duplicate ingress proving one immutable event and one
+`PROCESS_EVENT` job are created for one delivery identity.
 
-The canonical frontend production build is:
+Two temporary-project probes are also available:
 
 ```bat
-docker compose exec web npm run build
+docker compose --profile reliability run --rm --build recovery-probe
+docker compose --profile reliability run --rm --build load-probe
 ```
+
+The load probe defaults to 200 unique ingests at concurrency 20 plus a
+20-request duplicate burst, then waits for the queue to drain. Both probes
+delete their temporary project before exiting.
+
+## API identity
+
+```json
+{"name":"EventForge","version":"0.8.0","status":"reliability-hardened"}
+```
+
+## Delivery guarantee boundary
+
+The internal queue is durable and lease-based, but EventForge still does not
+claim exactly-once external side effects. A remote HTTP action can succeed just
+before a worker crashes and before local success is committed. Integrations
+should use destination-side idempotency where supported.
 
 ## Milestone boundary
 
-v0.7 is a pre-v1 engineering console rather than a finished multi-user SaaS UI.
-It intentionally does not add OAuth, organizations, billing, RBAC, arbitrary
-workflow code, or a fourth EventForge product.
-
-The next milestone is v0.8 failure/load/recovery hardening across the existing
-HookLedger + ReplayDB + FlowTrace system.
+v0.8 is reliability hardening for HookLedger, ReplayDB, and FlowTrace only.
+Deployment packaging, public hosting, production secrets, reverse proxy/TLS,
+and the release-candidate process remain v0.9 work.

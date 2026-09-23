@@ -12,9 +12,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0"
 
 from app.db import db_connect
+from app.jobs import promote_due_retries, recover_expired_leases
 from app.security import (
     ADMIN_PASSWORD,
     ADMIN_USER,
@@ -33,7 +34,7 @@ MAX_INGEST_BYTES = int(os.getenv("EVENTFORGE_MAX_INGEST_BYTES", "1048576"))
 app = FastAPI(
     title="EventForge Control API",
     version=APP_VERSION,
-    description="v0.7 unified HookLedger + ReplayDB + FlowTrace operations dashboard",
+    description="v0.8 reliability-hardened HookLedger + ReplayDB + FlowTrace platform",
 )
 
 app.add_middleware(
@@ -137,7 +138,7 @@ def root() -> dict[str, str]:
     return {
         "name": "EventForge",
         "version": APP_VERSION,
-        "status": "unified-dashboard",
+        "status": "reliability-hardened",
     }
 
 
@@ -159,6 +160,20 @@ def ready() -> dict[str, str]:
         raise HTTPException(status_code=503, detail="database not ready") from exc
 
     return {"status": "ready", "database": "ok"}
+
+
+@app.post("/operations/recover-jobs")
+def recover_jobs_now(
+    _: Annotated[None, Depends(require_admin)],
+) -> dict[str, int]:
+    """Run one bounded recovery pass without waiting for the worker loop."""
+    recovery = recover_expired_leases(limit=1000)
+    promoted = promote_due_retries(limit=1000)
+    return {
+        "expired_requeued": recovery["requeued"],
+        "expired_dead_lettered": recovery["dead_lettered"],
+        "due_retries_promoted": promoted,
+    }
 
 
 @app.post("/projects", status_code=status.HTTP_201_CREATED)
@@ -234,6 +249,55 @@ def get_project_summary(
             counts = cur.fetchone()
     assert counts is not None
     return {"project": project, "counts": counts}
+
+
+@app.get("/projects/{project_id}/queue-health")
+def get_project_queue_health(
+    project_id: uuid.UUID,
+    _: Annotated[None, Depends(require_control_access)],
+) -> dict[str, Any]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM projects WHERE id = %s", (project_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=404, detail="project not found")
+            cur.execute(
+                """
+                SELECT
+                    count(*) FILTER (WHERE status = 'PENDING')::integer AS pending,
+                    count(*) FILTER (WHERE status = 'RUNNING')::integer AS running,
+                    count(*) FILTER (WHERE status = 'RETRY_WAIT')::integer AS retry_wait,
+                    count(*) FILTER (WHERE status = 'DEAD_LETTERED')::integer AS dead_lettered,
+                    count(*) FILTER (WHERE status = 'SUCCESS')::integer AS success,
+                    count(*) FILTER (
+                        WHERE status = 'RUNNING'
+                          AND lease_expires_at IS NOT NULL
+                          AND lease_expires_at <= now()
+                    )::integer AS expired_leases,
+                    count(*) FILTER (WHERE recovery_count > 0)::integer AS recovered_jobs,
+                    COALESCE(sum(recovery_count), 0)::integer AS total_recoveries,
+                    max(last_recovered_at) AS last_recovered_at,
+                    max(last_heartbeat_at) FILTER (WHERE status = 'RUNNING') AS latest_running_heartbeat_at,
+                    CASE
+                        WHEN min(available_at) FILTER (
+                            WHERE status = 'PENDING'
+                               OR (status = 'RETRY_WAIT' AND available_at <= now())
+                        ) IS NULL THEN NULL
+                        ELSE GREATEST(0, EXTRACT(EPOCH FROM (
+                            now() - min(available_at) FILTER (
+                                WHERE status = 'PENDING'
+                                   OR (status = 'RETRY_WAIT' AND available_at <= now())
+                            )
+                        )))::double precision
+                    END AS oldest_actionable_age_seconds
+                FROM jobs
+                WHERE project_id = %s
+                """,
+                (project_id,),
+            )
+            health = cur.fetchone()
+    assert health is not None
+    return {"project_id": project_id, **health}
 
 
 @app.post("/projects/{project_id}/api-keys", status_code=status.HTTP_201_CREATED)
@@ -555,7 +619,8 @@ def get_event_integration(
                 """
                 SELECT id, kind, status, attempt_count, max_attempts,
                        replay_execution_id, workflow_run_id, step_run_id,
-                       available_at, last_error, created_at, completed_at
+                       available_at, last_error, last_heartbeat_at,
+                       recovery_count, last_recovered_at, created_at, completed_at
                 FROM jobs
                 WHERE event_id = %s
                 ORDER BY created_at
@@ -639,6 +704,7 @@ def list_jobs(
                     SELECT id, project_id, event_id, replay_execution_id, workflow_run_id, step_run_id, kind, status,
                            attempt_count, max_attempts, available_at,
                            lease_owner, lease_expires_at, last_error,
+                           last_heartbeat_at, recovery_count, last_recovered_at,
                            created_at, updated_at, completed_at
                     FROM jobs
                     WHERE project_id = %s
@@ -653,6 +719,7 @@ def list_jobs(
                     SELECT id, project_id, event_id, replay_execution_id, workflow_run_id, step_run_id, kind, status,
                            attempt_count, max_attempts, available_at,
                            lease_owner, lease_expires_at, last_error,
+                           last_heartbeat_at, recovery_count, last_recovered_at,
                            created_at, updated_at, completed_at
                     FROM jobs
                     WHERE project_id = %s AND status = %s
@@ -676,7 +743,8 @@ def get_job(
                 SELECT id, project_id, event_id, replay_execution_id, workflow_run_id, step_run_id, kind, status,
                        attempt_count, max_attempts, available_at,
                        lease_owner, lease_token, lease_expires_at,
-                       last_error, created_at, updated_at, completed_at
+                       last_error, last_heartbeat_at, recovery_count, last_recovered_at,
+                       created_at, updated_at, completed_at
                 FROM jobs
                 WHERE id = %s
                 """,

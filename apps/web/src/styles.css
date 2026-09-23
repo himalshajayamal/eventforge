@@ -305,3 +305,37 @@ summary { cursor: pointer; color: #53627a; font-weight: 700; }
   .inline-form { display: grid; grid-template-columns: 1fr; }
   .inline-form label { min-width: 0; }
 }
+
+.reliability-strip {
+  margin-bottom: 16px;
+}
+
+.reliability-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.reliability-grid > div {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+  background: rgba(248, 250, 252, 0.75);
+}
+
+.reliability-grid span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.reliability-grid strong {
+  font-size: 18px;
+}
+
+@media (max-width: 900px) {
+  .reliability-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

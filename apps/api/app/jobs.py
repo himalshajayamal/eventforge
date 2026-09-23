@@ -88,7 +88,7 @@ def recover_expired_leases(*, limit: int = 100) -> dict[str, int]:
                 FROM jobs
                 WHERE status = 'RUNNING'
                   AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at <= now()
+                  AND lease_expires_at <= clock_timestamp()
                 ORDER BY lease_expires_at, id
                 FOR UPDATE SKIP LOCKED
                 LIMIT %s
@@ -121,6 +121,8 @@ def recover_expired_leases(*, limit: int = 100) -> dict[str, int]:
                             lease_token = NULL,
                             lease_expires_at = NULL,
                             last_error = %s,
+                            recovery_count = recovery_count + 1,
+                            last_recovered_at = now(),
                             completed_at = now(),
                             updated_at = now()
                         WHERE id = %s
@@ -138,6 +140,8 @@ def recover_expired_leases(*, limit: int = 100) -> dict[str, int]:
                             lease_token = NULL,
                             lease_expires_at = NULL,
                             last_error = %s,
+                            recovery_count = recovery_count + 1,
+                            last_recovered_at = now(),
                             updated_at = now()
                         WHERE id = %s
                         """,
@@ -189,6 +193,7 @@ def claim_job(
                     lease_owner = %s,
                     lease_token = %s,
                     lease_expires_at = now() + (%s * interval '1 second'),
+                    last_heartbeat_at = now(),
                     updated_at = now()
                 FROM candidate
                 WHERE j.id = candidate.id
@@ -196,6 +201,7 @@ def claim_job(
                           j.workflow_run_id, j.step_run_id, j.kind, j.status,
                           j.attempt_count, j.max_attempts, j.available_at,
                           j.lease_owner, j.lease_token, j.lease_expires_at,
+                          j.last_heartbeat_at, j.recovery_count, j.last_recovered_at,
                           j.created_at, j.updated_at
                 """,
                 (supported_kinds, worker_id, lease_token, lease_seconds),
@@ -223,6 +229,34 @@ def claim_job(
                 ),
             )
 
+            # The attempt INSERT can legitimately block on foreign-key or table
+            # locks. Refresh the lease after that persistence work so the lease
+            # begins from the point the claim transaction is ready to commit,
+            # not from the transaction's original timestamp.
+            cur.execute(
+                """
+                WITH lease_clock AS (
+                    SELECT clock_timestamp() AS ts
+                )
+                UPDATE jobs AS j
+                SET lease_expires_at = lease_clock.ts + (%s * interval '1 second'),
+                    last_heartbeat_at = lease_clock.ts,
+                    updated_at = lease_clock.ts
+                FROM lease_clock
+                WHERE j.id = %s
+                  AND j.status = 'RUNNING'
+                  AND j.lease_token = %s
+                RETURNING j.lease_expires_at, j.last_heartbeat_at, j.updated_at
+                """,
+                (lease_seconds, job["id"], lease_token),
+            )
+            refreshed = cur.fetchone()
+            if refreshed is None:
+                raise LostLeaseError("cannot refresh newly claimed job lease")
+            job["lease_expires_at"] = refreshed["lease_expires_at"]
+            job["last_heartbeat_at"] = refreshed["last_heartbeat_at"]
+            job["updated_at"] = refreshed["updated_at"]
+
     return job
 
 
@@ -235,11 +269,12 @@ def renew_lease(job_id: uuid.UUID, lease_token: uuid.UUID, *, lease_seconds: int
                 """
                 UPDATE jobs
                 SET lease_expires_at = now() + (%s * interval '1 second'),
+                    last_heartbeat_at = now(),
                     updated_at = now()
                 WHERE id = %s
                   AND status = 'RUNNING'
                   AND lease_token = %s
-                  AND lease_expires_at > now()
+                  AND lease_expires_at > clock_timestamp()
                 RETURNING id
                 """,
                 (lease_seconds, job_id, lease_token),
@@ -264,7 +299,7 @@ def complete_job(job_id: uuid.UUID, lease_token: uuid.UUID) -> None:
                 WHERE id = %s
                   AND status = 'RUNNING'
                   AND lease_token = %s
-                  AND lease_expires_at > now()
+                  AND lease_expires_at > clock_timestamp()
                 RETURNING id
                 """,
                 (job_id, lease_token),
@@ -305,7 +340,7 @@ def fail_job(
                 WHERE id = %s
                   AND status = 'RUNNING'
                   AND lease_token = %s
-                  AND lease_expires_at > now()
+                  AND lease_expires_at > clock_timestamp()
                 FOR UPDATE
                 """,
                 (job_id, lease_token),

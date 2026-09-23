@@ -17,6 +17,7 @@ from app.jobs import (
     fail_job,
     promote_due_retries,
     recover_expired_leases,
+    renew_lease,
 )
 from app.workflows import (
     process_workflow_step_job,
@@ -28,6 +29,7 @@ POLL_SECONDS = float(os.getenv("EVENTFORGE_WORKER_POLL_SECONDS", "0.5"))
 LEASE_SECONDS = int(os.getenv("EVENTFORGE_JOB_LEASE_SECONDS", "30"))
 RETRY_BASE_SECONDS = float(os.getenv("EVENTFORGE_RETRY_BASE_SECONDS", "2"))
 RETRY_MAX_SECONDS = float(os.getenv("EVENTFORGE_RETRY_MAX_SECONDS", "600"))
+HEARTBEAT_SECONDS = float(os.getenv("EVENTFORGE_JOB_HEARTBEAT_SECONDS", "10"))
 WORKER_ID = os.getenv(
     "EVENTFORGE_WORKER_ID",
     f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}",
@@ -117,15 +119,74 @@ def process_job(job: dict[str, Any]) -> None:
     raise RuntimeError(f"unsupported job kind: {job['kind']}")
 
 
+
+def _heartbeat_job_lease(
+    job: dict[str, Any],
+    heartbeat_stop: threading.Event,
+    heartbeat_lost: threading.Event,
+) -> None:
+    """Renew a claimed job lease while its handler is executing."""
+    while not heartbeat_stop.wait(HEARTBEAT_SECONDS):
+        try:
+            renewed = renew_lease(
+                job["id"],
+                job["lease_token"],
+                lease_seconds=LEASE_SECONDS,
+            )
+        except Exception as exc:
+            log_record(
+                "WARN",
+                "job_heartbeat",
+                "error",
+                job_id=job["id"],
+                job_kind=job["kind"],
+                error=str(exc),
+            )
+            continue
+        if not renewed:
+            heartbeat_lost.set()
+            log_record(
+                "WARN",
+                "job_heartbeat",
+                "lost_lease",
+                job_id=job["id"],
+                job_kind=job["kind"],
+            )
+            return
+        log_record(
+            "INFO",
+            "job_heartbeat",
+            "renewed",
+            job_id=job["id"],
+            job_kind=job["kind"],
+        )
+
+
+def _stop_heartbeat(heartbeat_stop: threading.Event, thread: threading.Thread) -> None:
+    heartbeat_stop.set()
+    thread.join(timeout=max(1.0, min(HEARTBEAT_SECONDS + 1.0, 5.0)))
+
+
 def request_stop(signum: int, _frame: Any) -> None:
     log_record("INFO", "worker_signal", "stopping", signal=signum)
     stop_event.set()
 
 
 def run() -> None:
+    if LEASE_SECONDS < 2:
+        raise RuntimeError("EVENTFORGE_JOB_LEASE_SECONDS must be at least 2")
+    if HEARTBEAT_SECONDS <= 0 or HEARTBEAT_SECONDS >= LEASE_SECONDS:
+        raise RuntimeError("EVENTFORGE_JOB_HEARTBEAT_SECONDS must be > 0 and less than the lease duration")
+
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-    log_record("INFO", "worker_start", "ok", lease_seconds=LEASE_SECONDS)
+    log_record(
+        "INFO",
+        "worker_start",
+        "ok",
+        lease_seconds=LEASE_SECONDS,
+        heartbeat_seconds=HEARTBEAT_SECONDS,
+    )
 
     while not stop_event.is_set():
         recovery = recover_expired_leases()
@@ -160,13 +221,37 @@ def run() -> None:
             base_fields["step_run_id"] = job["step_run_id"]
         log_record("INFO", "job_claim", "claimed", **base_fields)
 
+        heartbeat_stop = threading.Event()
+        heartbeat_lost = threading.Event()
+        heartbeat_thread = threading.Thread(
+            target=_heartbeat_job_lease,
+            args=(job, heartbeat_stop, heartbeat_lost),
+            name=f"eventforge-heartbeat-{job['id']}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
+
         try:
             process_job(job)
+            _stop_heartbeat(heartbeat_stop, heartbeat_thread)
+            if heartbeat_lost.is_set():
+                raise LostLeaseError("job lease was lost while handler was executing")
             complete_job(job["id"], job["lease_token"])
             log_record("INFO", "job_execute", "success", **base_fields)
         except LostLeaseError as exc:
+            _stop_heartbeat(heartbeat_stop, heartbeat_thread)
             log_record("WARN", "job_execute", "lost_lease", error=str(exc), **base_fields)
         except Exception as exc:  # worker boundary: persist failure instead of crashing the loop
+            _stop_heartbeat(heartbeat_stop, heartbeat_thread)
+            if heartbeat_lost.is_set():
+                log_record(
+                    "WARN",
+                    "job_execute",
+                    "lost_lease",
+                    error=str(exc),
+                    **base_fields,
+                )
+                continue
             try:
                 state = fail_job(
                     job["id"],

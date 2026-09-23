@@ -67,9 +67,28 @@ export interface JobRow {
   lease_owner: string | null;
   lease_expires_at: string | null;
   last_error: string | null;
+  last_heartbeat_at: string | null;
+  recovery_count: number;
+  last_recovered_at: string | null;
   created_at: string;
   updated_at: string;
   completed_at: string | null;
+}
+
+
+export interface QueueHealth {
+  project_id: string;
+  pending: number;
+  running: number;
+  retry_wait: number;
+  dead_lettered: number;
+  success: number;
+  expired_leases: number;
+  recovered_jobs: number;
+  total_recoveries: number;
+  last_recovered_at: string | null;
+  latest_running_heartbeat_at: string | null;
+  oldest_actionable_age_seconds: number | null;
 }
 
 export interface ReplayRow {
