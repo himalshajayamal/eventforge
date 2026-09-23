@@ -15,7 +15,7 @@ from app.jobs import (
     retry_delay_seconds,
 )
 from app.main import ADMIN_PASSWORD, ADMIN_USER, app
-from app.worker import process_replay_job
+from app.worker import process_event_job, process_replay_job
 from app.workflows import process_workflow_step_job, schedule_workflows_for_event
 
 client = TestClient(app)
@@ -123,8 +123,8 @@ def test_health() -> None:
 def test_root_version() -> None:
     response = client.get("/")
     assert response.status_code == 200
-    assert response.json()["version"] == "0.4.0"
-    assert response.json()["status"] == "flowtrace"
+    assert response.json()["version"] == "0.5.0"
+    assert response.json()["status"] == "integrated-core"
 
 
 def test_control_plane_requires_authentication() -> None:
@@ -761,3 +761,178 @@ def test_flowtrace_expired_step_lease_resumes_after_previous_step_commit() -> No
     assert run["context"]["phase"] == "two"
     assert [step["status"] for step in get_step_rows(run_ids[0])] == ["SUCCESS", "SUCCESS"]
     assert attempt_outcomes(str(second["id"])) == ["LEASE_EXPIRED", "SUCCESS"]
+
+
+def test_integrated_process_event_schedules_matching_flowtrace_run() -> None:
+    project_id, event_id = create_event()
+    workflow = create_workflow_api(project_id)
+
+    process_event_job(
+        {
+            "project_id": uuid.UUID(project_id),
+            "event_id": uuid.UUID(event_id),
+            "kind": "PROCESS_EVENT",
+        }
+    )
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT wr.id, wr.workflow_id, v.version_number, wr.replay_execution_id
+                FROM workflow_runs AS wr
+                JOIN workflow_versions AS v ON v.id = wr.workflow_version_id
+                WHERE wr.event_id = %s AND wr.workflow_id = %s
+                """,
+                (event_id, workflow["id"]),
+            )
+            run = cur.fetchone()
+    assert run is not None
+    assert run["version_number"] == 1
+    assert run["replay_execution_id"] is None
+
+
+def test_replay_current_selection_is_frozen_at_request_time() -> None:
+    project_id, event_id = create_event()
+    workflow = create_workflow_api(project_id)
+
+    original_runs = schedule_workflows_for_event(uuid.UUID(project_id), uuid.UUID(event_id))
+    assert len(original_runs) == 1
+
+    version_two = client.post(
+        f"/workflows/{workflow['id']}/versions",
+        auth=ADMIN_AUTH,
+        json={
+            "trigger": {"source": "generic", "type": "test.created"},
+            "steps": [{"type": "json_transform", "set": {"version": 2}}],
+            "activate": True,
+        },
+    )
+    assert version_two.status_code == 201
+
+    replay = client.post(
+        f"/events/{event_id}/replays",
+        auth=ADMIN_AUTH,
+        json={"workflow_version_mode": "current"},
+    )
+    assert replay.status_code == 202
+    replay_body = replay.json()
+    assert replay_body["workflow_selection_count"] == 1
+
+    version_three = client.post(
+        f"/workflows/{workflow['id']}/versions",
+        auth=ADMIN_AUTH,
+        json={
+            "trigger": {"source": "generic", "type": "test.created"},
+            "steps": [{"type": "json_transform", "set": {"version": 3}}],
+            "activate": True,
+        },
+    )
+    assert version_three.status_code == 201
+
+    selections = client.get(
+        f"/replays/{replay_body['id']}/workflow-selections",
+        auth=ADMIN_AUTH,
+    )
+    assert selections.status_code == 200
+    assert len(selections.json()) == 1
+    assert selections.json()[0]["version_number"] == 2
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, project_id, event_id, replay_execution_id, kind
+                FROM jobs
+                WHERE replay_execution_id = %s
+                """,
+                (replay_body["id"],),
+            )
+            replay_job = cur.fetchone()
+    assert replay_job is not None
+    process_replay_job(replay_job)
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT v.version_number
+                FROM workflow_runs AS wr
+                JOIN workflow_versions AS v ON v.id = wr.workflow_version_id
+                WHERE wr.replay_execution_id = %s
+                """,
+                (replay_body["id"],),
+            )
+            replay_run = cur.fetchone()
+    assert replay_run is not None
+    assert replay_run["version_number"] == 2
+
+
+def test_event_integration_view_connects_all_three_products() -> None:
+    project_id, event_id = create_event()
+    create_workflow_api(
+        project_id,
+        steps=[{"type": "emit_event", "source": "flowtrace", "event_type": "integrated.done"}],
+    )
+
+    run_ids = schedule_workflows_for_event(uuid.UUID(project_id), uuid.UUID(event_id))
+    assert len(run_ids) == 1
+    run = drive_workflow_until_terminal(run_ids[0])
+    assert run["status"] == "SUCCESS"
+
+    replay = client.post(
+        f"/events/{event_id}/replays",
+        auth=ADMIN_AUTH,
+        json={"workflow_version_mode": "original"},
+    )
+    assert replay.status_code == 202
+    assert replay.json()["workflow_selection_count"] == 1
+
+    integrated = client.get(f"/events/{event_id}/integration", auth=ADMIN_AUTH)
+    assert integrated.status_code == 200
+    body = integrated.json()
+    assert body["event"]["id"] == event_id
+    assert any(job["kind"] == "PROCESS_EVENT" for job in body["jobs"])
+    assert any(item["status"] == "SUCCESS" for item in body["workflow_runs"])
+    assert len(body["replays"]) == 1
+    assert body["replays"][0]["workflow_selection_count"] == 1
+    assert any(item["type"] == "integrated.done" for item in body["emitted_events"])
+
+
+def test_replay_zero_selection_remains_frozen_after_workflow_is_created() -> None:
+    project_id, event_id = create_event()
+
+    replay = client.post(
+        f"/events/{event_id}/replays",
+        auth=ADMIN_AUTH,
+        json={"workflow_version_mode": "current"},
+    )
+    assert replay.status_code == 202
+    replay_body = replay.json()
+    assert replay_body["workflow_selection_count"] == 0
+
+    create_workflow_api(project_id)
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, project_id, event_id, replay_execution_id, kind
+                FROM jobs
+                WHERE replay_execution_id = %s
+                """,
+                (replay_body["id"],),
+            )
+            replay_job = cur.fetchone()
+    assert replay_job is not None
+    process_replay_job(replay_job)
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) AS count FROM workflow_runs WHERE replay_execution_id = %s",
+                (replay_body["id"],),
+            )
+            row = cur.fetchone()
+    assert row is not None
+    assert row["count"] == 0

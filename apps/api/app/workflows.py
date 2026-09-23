@@ -138,7 +138,7 @@ def execute_http_request(config: dict[str, Any], context: dict[str, Any], step_r
         raise WorkflowActionError("http_request timeout must be between 0 and 10 seconds")
 
     headers = {
-        "User-Agent": "EventForge/0.4.0",
+        "User-Agent": "EventForge/0.5.0",
         "Accept": "application/json, */*;q=0.8",
         "Idempotency-Key": str(step_run_id),
     }
@@ -168,6 +168,73 @@ def execute_http_request(config: dict[str, Any], context: dict[str, Any], step_r
         raise WorkflowActionError(f"http_request failed: {exc.reason}") from exc
 
 
+def snapshot_replay_workflow_selections(
+    cur,
+    *,
+    project_id: uuid.UUID,
+    event_id: uuid.UUID,
+    replay_execution_id: uuid.UUID,
+    mode: str,
+) -> int:
+    """Freeze ReplayDB -> FlowTrace workflow-version resolution at replay request time.
+
+    `original` reuses the workflow versions that processed the original event.
+    `current` snapshots the active matching workflow versions visible when the
+    replay is requested. Later workflow activation changes therefore cannot
+    silently change the meaning of an already-created replay.
+    """
+    if mode not in {"original", "current"}:
+        raise ValueError("mode must be current or original")
+
+    if mode == "original":
+        cur.execute(
+            """
+            SELECT DISTINCT wr.workflow_id, wr.workflow_version_id
+            FROM workflow_runs AS wr
+            WHERE wr.project_id = %s
+              AND wr.event_id = %s
+              AND wr.replay_execution_id IS NULL
+            ORDER BY wr.workflow_id, wr.workflow_version_id
+            """,
+            (project_id, event_id),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT w.id AS workflow_id, v.id AS workflow_version_id
+            FROM events AS e
+            JOIN workflows AS w ON w.project_id = e.project_id
+            JOIN workflow_versions AS v ON v.id = w.active_version_id
+            WHERE e.id = %s
+              AND e.project_id = %s
+              AND w.enabled = true
+              AND (v.trigger_source = e.source OR v.trigger_source = '*')
+              AND (v.trigger_type = e.type OR v.trigger_type = '*')
+            ORDER BY w.created_at, w.id
+            """,
+            (event_id, project_id),
+        )
+
+    rows = list(cur.fetchall())
+    for row in rows:
+        cur.execute(
+            """
+            INSERT INTO replay_workflow_selections(
+                replay_execution_id, project_id, workflow_id, workflow_version_id
+            )
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (replay_execution_id, workflow_id) DO NOTHING
+            """,
+            (
+                replay_execution_id,
+                project_id,
+                row["workflow_id"],
+                row["workflow_version_id"],
+            ),
+        )
+    return len(rows)
+
+
 def _candidate_versions(
     project_id: uuid.UUID,
     event_id: uuid.UUID,
@@ -177,20 +244,51 @@ def _candidate_versions(
 ) -> list[dict[str, Any]]:
     with db_connect() as conn:
         with conn.cursor() as cur:
-            if replay_execution_id is not None and mode == "original":
+            if replay_execution_id is not None:
                 cur.execute(
                     """
-                    SELECT DISTINCT wr.workflow_id, wr.workflow_version_id,
-                           v.definition
-                    FROM workflow_runs AS wr
-                    JOIN workflow_versions AS v ON v.id = wr.workflow_version_id
-                    WHERE wr.event_id = %s
-                      AND wr.replay_execution_id IS NULL
-                    ORDER BY wr.workflow_id, wr.workflow_version_id
+                    SELECT workflow_selection_snapshot_at
+                    FROM replay_executions
+                    WHERE id = %s AND project_id = %s
                     """,
-                    (event_id,),
+                    (replay_execution_id, project_id),
                 )
-                return list(cur.fetchall())
+                replay_row = cur.fetchone()
+                if replay_row is None:
+                    raise WorkflowActionError("replay execution not found")
+
+                cur.execute(
+                    """
+                    SELECT s.workflow_id, s.workflow_version_id, v.definition
+                    FROM replay_workflow_selections AS s
+                    JOIN workflow_versions AS v ON v.id = s.workflow_version_id
+                    WHERE s.replay_execution_id = %s
+                      AND s.project_id = %s
+                    ORDER BY s.created_at, s.workflow_id
+                    """,
+                    (replay_execution_id, project_id),
+                )
+                selected = list(cur.fetchall())
+                if replay_row["workflow_selection_snapshot_at"] is not None:
+                    return selected
+
+                # Compatibility for replay rows created before v0.5.0. Those
+                # replays predate selection snapshots, so retain v0.4 behavior.
+                if mode == "original":
+                    cur.execute(
+                        """
+                        SELECT DISTINCT wr.workflow_id, wr.workflow_version_id,
+                               v.definition
+                        FROM workflow_runs AS wr
+                        JOIN workflow_versions AS v ON v.id = wr.workflow_version_id
+                        WHERE wr.event_id = %s
+                          AND wr.project_id = %s
+                          AND wr.replay_execution_id IS NULL
+                        ORDER BY wr.workflow_id, wr.workflow_version_id
+                        """,
+                        (event_id, project_id),
+                    )
+                    return list(cur.fetchall())
 
             cur.execute(
                 """
@@ -209,7 +307,6 @@ def _candidate_versions(
                 (event_id, project_id),
             )
             return list(cur.fetchall())
-
 
 def schedule_workflows_for_event(
     project_id: uuid.UUID,

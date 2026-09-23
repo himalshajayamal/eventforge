@@ -50,6 +50,29 @@ services:
         condition: service_healthy
     stop_grace_period: 5s
 
+
+  test:
+    build:
+      context: ./apps/api
+    command: ["python", "tests/run_isolated.py"]
+    environment:
+      EVENTFORGE_TEST_ADMIN_DATABASE_URL: ${EVENTFORGE_TEST_ADMIN_DATABASE_URL:-postgresql://eventforge:eventforge_dev_only@db:5432/postgres}
+      EVENTFORGE_TEST_DATABASE_URL: ${EVENTFORGE_TEST_DATABASE_URL:-postgresql://eventforge:eventforge_dev_only@db:5432/eventforge_test}
+      EVENTFORGE_TEST_DATABASE_NAME: ${EVENTFORGE_TEST_DATABASE_NAME:-eventforge_test}
+      EVENTFORGE_TEST_MIGRATIONS_DIR: /migrations
+      EVENTFORGE_ADMIN_USER: ${EVENTFORGE_ADMIN_USER:-eventforge}
+      EVENTFORGE_ADMIN_PASSWORD: ${EVENTFORGE_ADMIN_PASSWORD:-eventforge_dev_only_admin}
+      EVENTFORGE_MAX_INGEST_BYTES: ${EVENTFORGE_MAX_INGEST_BYTES:-1048576}
+      EVENTFORGE_HTTP_ACTION_MAX_RESPONSE_BYTES: ${EVENTFORGE_HTTP_ACTION_MAX_RESPONSE_BYTES:-1048576}
+      EVENTFORGE_ALLOW_PRIVATE_HTTP_ACTIONS: ${EVENTFORGE_ALLOW_PRIVATE_HTTP_ACTIONS:-0}
+      EVENTFORGE_ALLOW_INSECURE_HTTP_ACTIONS: ${EVENTFORGE_ALLOW_INSECURE_HTTP_ACTIONS:-0}
+    volumes:
+      - ./database/migrations:/migrations:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles: ["test"]
+
   web:
     build:
       context: ./apps/web

@@ -11,10 +11,10 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 
 from app.db import db_connect
-from app.workflows import schedule_workflows_for_event
+from app.workflows import schedule_workflows_for_event, snapshot_replay_workflow_selections
 
 ADMIN_USER = os.getenv("EVENTFORGE_ADMIN_USER", "eventforge")
 ADMIN_PASSWORD = os.getenv("EVENTFORGE_ADMIN_PASSWORD", "eventforge_dev_only_admin")
@@ -23,7 +23,7 @@ MAX_INGEST_BYTES = int(os.getenv("EVENTFORGE_MAX_INGEST_BYTES", "1048576"))
 app = FastAPI(
     title="EventForge Control API",
     version=APP_VERSION,
-    description="v0.4 FlowTrace durable automation workflows",
+    description="v0.5 integrated HookLedger + ReplayDB + FlowTrace core",
 )
 
 app.add_middleware(
@@ -145,7 +145,7 @@ def root() -> dict[str, str]:
     return {
         "name": "EventForge",
         "version": APP_VERSION,
-        "status": "flowtrace",
+        "status": "integrated-core",
     }
 
 
@@ -341,6 +341,94 @@ def get_event(
     return event
 
 
+@app.get("/events/{event_id}/integration")
+def get_event_integration(
+    event_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+) -> dict[str, Any]:
+    """Return one cross-product view for HookLedger, FlowTrace and ReplayDB."""
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT e.id, e.project_id, e.endpoint_id, e.source, e.type,
+                       e.provider_delivery_id, e.trace_id, e.parent_event_id,
+                       e.emitted_by_step_run_id, e.received_at,
+                       p.content_type, p.size_bytes, p.sha256
+                FROM events AS e
+                JOIN event_payloads AS p ON p.event_id = e.id
+                WHERE e.id = %s
+                """,
+                (event_id,),
+            )
+            event = cur.fetchone()
+            if event is None:
+                raise HTTPException(status_code=404, detail="event not found")
+
+            cur.execute(
+                """
+                SELECT id, kind, status, attempt_count, max_attempts,
+                       replay_execution_id, workflow_run_id, step_run_id,
+                       available_at, last_error, created_at, completed_at
+                FROM jobs
+                WHERE event_id = %s
+                ORDER BY created_at
+                """,
+                (event_id,),
+            )
+            jobs = list(cur.fetchall())
+
+            cur.execute(
+                """
+                SELECT wr.id, wr.workflow_id, w.name AS workflow_name,
+                       wr.workflow_version_id, v.version_number,
+                       wr.replay_execution_id, wr.status, wr.error,
+                       wr.created_at, wr.started_at, wr.completed_at
+                FROM workflow_runs AS wr
+                JOIN workflows AS w ON w.id = wr.workflow_id
+                JOIN workflow_versions AS v ON v.id = wr.workflow_version_id
+                WHERE wr.event_id = %s
+                ORDER BY wr.created_at
+                """,
+                (event_id,),
+            )
+            workflow_runs = list(cur.fetchall())
+
+            cur.execute(
+                """
+                SELECT r.id, r.workflow_version_mode, r.workflow_selection_snapshot_at, r.created_at,
+                       j.id AS job_id, j.status AS job_status,
+                       COUNT(s.workflow_id)::integer AS workflow_selection_count
+                FROM replay_executions AS r
+                JOIN jobs AS j ON j.replay_execution_id = r.id
+                LEFT JOIN replay_workflow_selections AS s
+                       ON s.replay_execution_id = r.id
+                WHERE r.replay_of = %s
+                GROUP BY r.id, r.workflow_version_mode, r.workflow_selection_snapshot_at, r.created_at, j.id, j.status
+                ORDER BY r.created_at
+                """,
+                (event_id,),
+            )
+            replays = list(cur.fetchall())
+
+            cur.execute(
+                """
+                SELECT id, source, type, trace_id, emitted_by_step_run_id, received_at
+                FROM events
+                WHERE parent_event_id = %s
+                ORDER BY received_at
+                """,
+                (event_id,),
+            )
+            emitted_events = list(cur.fetchall())
+
+    return {
+        "event": event,
+        "jobs": jobs,
+        "workflow_runs": workflow_runs,
+        "replays": replays,
+        "emitted_events": emitted_events,
+    }
 
 
 @app.get("/projects/{project_id}/jobs")
@@ -444,11 +532,12 @@ def create_replay(
     payload: ReplayCreate,
     _: Annotated[None, Depends(require_admin)],
 ) -> dict[str, Any]:
-    """Create a new execution that references an immutable historical event.
+    """Create a replay and freeze its FlowTrace workflow-version selection.
 
-    v0.3 records whether the caller wants the original or current workflow
-    version. Workflow definitions themselves arrive in v0.4, so this milestone
-    persists the choice without inventing workflow rows that do not exist yet.
+    v0.5 makes replay meaning deterministic: ``original`` snapshots the versions
+    that handled the historical event, while ``current`` snapshots the active
+    matching versions at replay-request time. A later workflow activation cannot
+    silently change an already-created replay.
     """
     replay_id = uuid.uuid4()
     job_id = uuid.uuid4()
@@ -486,6 +575,22 @@ def create_replay(
             replay = cur.fetchone()
             assert replay is not None
 
+            workflow_selection_count = snapshot_replay_workflow_selections(
+                cur,
+                project_id=source["project_id"],
+                event_id=event_id,
+                replay_execution_id=replay_id,
+                mode=payload.workflow_version_mode,
+            )
+            cur.execute(
+                """
+                UPDATE replay_executions
+                SET workflow_selection_snapshot_at = now()
+                WHERE id = %s
+                """,
+                (replay_id,),
+            )
+
             cur.execute(
                 """
                 INSERT INTO jobs(
@@ -503,6 +608,7 @@ def create_replay(
         **replay,
         "job_id": job["id"],
         "job_status": job["status"],
+        "workflow_selection_count": workflow_selection_count,
     }
 
 
@@ -520,7 +626,7 @@ def list_event_replays(
             cur.execute(
                 """
                 SELECT r.id, r.project_id, r.replay_of, r.workflow_version_mode,
-                       r.created_at, j.id AS job_id, j.status AS job_status,
+                       r.workflow_selection_snapshot_at, r.created_at, j.id AS job_id, j.status AS job_status,
                        j.attempt_count, j.max_attempts, j.last_error, j.completed_at
                 FROM replay_executions AS r
                 JOIN jobs AS j ON j.replay_execution_id = r.id
@@ -544,7 +650,7 @@ def list_project_replays(
             cur.execute(
                 """
                 SELECT r.id, r.project_id, r.replay_of, r.workflow_version_mode,
-                       r.created_at, j.id AS job_id, j.status AS job_status,
+                       r.workflow_selection_snapshot_at, r.created_at, j.id AS job_id, j.status AS job_status,
                        j.attempt_count, j.max_attempts, j.last_error, j.completed_at
                 FROM replay_executions AS r
                 JOIN jobs AS j ON j.replay_execution_id = r.id
@@ -567,7 +673,7 @@ def get_replay(
             cur.execute(
                 """
                 SELECT r.id, r.project_id, r.replay_of, r.workflow_version_mode,
-                       r.created_at, j.id AS job_id, j.status AS job_status,
+                       r.workflow_selection_snapshot_at, r.created_at, j.id AS job_id, j.status AS job_status,
                        j.attempt_count, j.max_attempts, j.available_at,
                        j.lease_owner, j.lease_expires_at, j.last_error,
                        j.completed_at
@@ -581,6 +687,33 @@ def get_replay(
     if replay is None:
         raise HTTPException(status_code=404, detail="replay not found")
     return replay
+
+
+@app.get("/replays/{replay_id}/workflow-selections")
+def list_replay_workflow_selections(
+    replay_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+) -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM replay_executions WHERE id = %s", (replay_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=404, detail="replay not found")
+            cur.execute(
+                """
+                SELECT s.replay_execution_id, s.project_id, s.workflow_id,
+                       w.name AS workflow_name, s.workflow_version_id,
+                       v.version_number, v.trigger_source, v.trigger_type,
+                       s.created_at
+                FROM replay_workflow_selections AS s
+                JOIN workflows AS w ON w.id = s.workflow_id
+                JOIN workflow_versions AS v ON v.id = s.workflow_version_id
+                WHERE s.replay_execution_id = %s
+                ORDER BY w.created_at, w.id
+                """,
+                (replay_id,),
+            )
+            return list(cur.fetchall())
 
 
 def _workflow_definition(trigger: WorkflowTrigger, steps: list[WorkflowStep]) -> dict[str, Any]:
