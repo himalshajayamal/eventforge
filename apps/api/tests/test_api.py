@@ -12,6 +12,7 @@ from app.jobs import (
     retry_delay_seconds,
 )
 from app.main import ADMIN_PASSWORD, ADMIN_USER, app
+from app.worker import process_replay_job
 
 client = TestClient(app)
 ADMIN_AUTH = (ADMIN_USER, ADMIN_PASSWORD)
@@ -80,6 +81,35 @@ def attempt_outcomes(job_id: str) -> list[str]:
             return [row["outcome"] for row in cur.fetchall()]
 
 
+
+
+def event_snapshot(event_id: str) -> dict:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT e.id, e.project_id, e.endpoint_id, e.source, e.type,
+                       e.provider_delivery_id, e.trace_id, e.headers, e.received_at,
+                       p.content_type, p.body, p.size_bytes, p.sha256, p.created_at
+                FROM events AS e
+                JOIN event_payloads AS p ON p.event_id = e.id
+                WHERE e.id = %s
+                """,
+                (event_id,),
+            )
+            row = cur.fetchone()
+    assert row is not None
+    return row
+
+
+def project_event_count(project_id: str) -> int:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) AS count FROM events WHERE project_id = %s", (project_id,))
+            row = cur.fetchone()
+    assert row is not None
+    return row["count"]
+
 def test_health() -> None:
     response = client.get("/health")
     assert response.status_code == 200
@@ -89,8 +119,8 @@ def test_health() -> None:
 def test_root_version() -> None:
     response = client.get("/")
     assert response.status_code == 200
-    assert response.json()["version"] == "0.2.0"
-    assert response.json()["status"] == "reliable-jobs"
+    assert response.json()["version"] == "0.3.0"
+    assert response.json()["status"] == "replaydb"
 
 
 def test_control_plane_requires_authentication() -> None:
@@ -219,7 +249,11 @@ def test_retry_then_dead_letter() -> None:
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE jobs SET available_at = now() WHERE id = %s", (job_id,))
-    assert promote_due_retries() >= 1
+    # A real background worker may promote this due retry between the UPDATE
+    # above and this call. Promotion is idempotent under concurrency: this call
+    # may perform the transition itself, or return 0 because the worker already
+    # won the race. The invariant we require is the resulting PENDING state.
+    promote_due_retries()
     assert get_job_row(job_id)["status"] == "PENDING"
 
     second = claim_job("worker-retry-b", kinds=(kind,))
@@ -321,3 +355,127 @@ def test_skip_locked_allows_two_workers_to_select_different_jobs() -> None:
         conn_b.rollback()
         conn_a.close()
         conn_b.close()
+
+def test_replay_creates_new_execution_without_mutating_original_event() -> None:
+    project_id, event_id = create_event()
+    before = event_snapshot(event_id)
+    before_count = project_event_count(project_id)
+
+    response = client.post(
+        f"/events/{event_id}/replays",
+        auth=ADMIN_AUTH,
+        json={"workflow_version_mode": "original"},
+    )
+    assert response.status_code == 202
+    replay = response.json()
+    assert replay["replay_of"] == event_id
+    assert replay["project_id"] == project_id
+    assert replay["workflow_version_mode"] == "original"
+    assert replay["job_status"] == "PENDING"
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, project_id, event_id, replay_execution_id, kind
+                FROM jobs
+                WHERE id = %s
+                """,
+                (replay["job_id"],),
+            )
+            job = cur.fetchone()
+    assert job is not None
+    assert job["kind"] == "REPLAY_EVENT"
+    assert str(job["event_id"]) == event_id
+    assert str(job["replay_execution_id"]) == replay["id"]
+
+    after = event_snapshot(event_id)
+    assert after == before
+    assert project_event_count(project_id) == before_count
+
+
+def test_multiple_replays_are_independent_and_record_workflow_mode() -> None:
+    project_id, event_id = create_event()
+
+    original = client.post(
+        f"/events/{event_id}/replays",
+        auth=ADMIN_AUTH,
+        json={"workflow_version_mode": "original"},
+    )
+    current = client.post(
+        f"/events/{event_id}/replays",
+        auth=ADMIN_AUTH,
+        json={"workflow_version_mode": "current"},
+    )
+
+    assert original.status_code == 202
+    assert current.status_code == 202
+    original_json = original.json()
+    current_json = current.json()
+    assert original_json["id"] != current_json["id"]
+    assert original_json["job_id"] != current_json["job_id"]
+    assert original_json["replay_of"] == event_id
+    assert current_json["replay_of"] == event_id
+    assert original_json["workflow_version_mode"] == "original"
+    assert current_json["workflow_version_mode"] == "current"
+
+    history = client.get(f"/events/{event_id}/replays", auth=ADMIN_AUTH)
+    assert history.status_code == 200
+    ids = {item["id"] for item in history.json()}
+    assert original_json["id"] in ids
+    assert current_json["id"] in ids
+    assert project_event_count(project_id) == 1
+
+
+def test_replay_requires_auth_and_valid_mode_and_event() -> None:
+    _, event_id = create_event()
+
+    unauthenticated = client.post(
+        f"/events/{event_id}/replays",
+        json={"workflow_version_mode": "original"},
+    )
+    assert unauthenticated.status_code == 401
+
+    invalid_mode = client.post(
+        f"/events/{event_id}/replays",
+        auth=ADMIN_AUTH,
+        json={"workflow_version_mode": "future"},
+    )
+    assert invalid_mode.status_code == 422
+
+    missing_event = client.post(
+        f"/events/{uuid.uuid4()}/replays",
+        auth=ADMIN_AUTH,
+        json={"workflow_version_mode": "current"},
+    )
+    assert missing_event.status_code == 404
+
+
+def test_replay_processor_reads_original_postgres_payload_without_copying_it() -> None:
+    project_id, event_id = create_event()
+    before = event_snapshot(event_id)
+
+    response = client.post(
+        f"/events/{event_id}/replays",
+        auth=ADMIN_AUTH,
+        json={"workflow_version_mode": "original"},
+    )
+    assert response.status_code == 202
+    replay = response.json()
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM jobs WHERE id = %s", (replay["job_id"],))
+            job = cur.fetchone()
+            cur.execute(
+                "SELECT count(*) AS count FROM event_payloads WHERE event_id = %s",
+                (event_id,),
+            )
+            payload_count = cur.fetchone()
+
+    assert job is not None
+    process_replay_job(job)
+    assert payload_count is not None
+    assert payload_count["count"] == 1
+    assert event_snapshot(event_id) == before
+    assert project_event_count(project_id) == 1

@@ -2,7 +2,7 @@ import hashlib
 import os
 import secrets
 import uuid
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import psycopg
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -11,7 +11,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 
 from app.db import db_connect
 
@@ -22,7 +22,7 @@ MAX_INGEST_BYTES = int(os.getenv("EVENTFORGE_MAX_INGEST_BYTES", "1048576"))
 app = FastAPI(
     title="EventForge Control API",
     version=APP_VERSION,
-    description="v0.2 HookLedger reliable jobs and retries",
+    description="v0.3 ReplayDB immutable event replay",
 )
 
 app.add_middleware(
@@ -43,6 +43,10 @@ class ProjectCreate(BaseModel):
 class EndpointCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     source: str = Field(default="generic", min_length=1, max_length=80)
+
+
+class ReplayCreate(BaseModel):
+    workflow_version_mode: Literal["original", "current"] = "original"
 
 
 
@@ -88,7 +92,7 @@ def root() -> dict[str, str]:
     return {
         "name": "EventForge",
         "version": APP_VERSION,
-        "status": "reliable-jobs",
+        "status": "replaydb",
     }
 
 
@@ -305,7 +309,7 @@ def list_jobs(
             if job_status is None:
                 cur.execute(
                     """
-                    SELECT id, project_id, event_id, kind, status,
+                    SELECT id, project_id, event_id, replay_execution_id, kind, status,
                            attempt_count, max_attempts, available_at,
                            lease_owner, lease_expires_at, last_error,
                            created_at, updated_at, completed_at
@@ -319,7 +323,7 @@ def list_jobs(
             else:
                 cur.execute(
                     """
-                    SELECT id, project_id, event_id, kind, status,
+                    SELECT id, project_id, event_id, replay_execution_id, kind, status,
                            attempt_count, max_attempts, available_at,
                            lease_owner, lease_expires_at, last_error,
                            created_at, updated_at, completed_at
@@ -342,7 +346,7 @@ def get_job(
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, project_id, event_id, kind, status,
+                SELECT id, project_id, event_id, replay_execution_id, kind, status,
                        attempt_count, max_attempts, available_at,
                        lease_owner, lease_token, lease_expires_at,
                        last_error, created_at, updated_at, completed_at
@@ -376,6 +380,154 @@ def list_job_attempts(
                 (job_id,),
             )
             return list(cur.fetchall())
+
+
+@app.post(
+    "/events/{event_id}/replays",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def create_replay(
+    event_id: uuid.UUID,
+    payload: ReplayCreate,
+    _: Annotated[None, Depends(require_admin)],
+) -> dict[str, Any]:
+    """Create a new execution that references an immutable historical event.
+
+    v0.3 records whether the caller wants the original or current workflow
+    version. Workflow definitions themselves arrive in v0.4, so this milestone
+    persists the choice without inventing workflow rows that do not exist yet.
+    """
+    replay_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT e.id, e.project_id
+                FROM events AS e
+                JOIN event_payloads AS p ON p.event_id = e.id
+                WHERE e.id = %s
+                """,
+                (event_id,),
+            )
+            source = cur.fetchone()
+            if source is None:
+                raise HTTPException(status_code=404, detail="event not found")
+
+            cur.execute(
+                """
+                INSERT INTO replay_executions(
+                    id, project_id, replay_of, workflow_version_mode
+                )
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, project_id, replay_of, workflow_version_mode, created_at
+                """,
+                (
+                    replay_id,
+                    source["project_id"],
+                    event_id,
+                    payload.workflow_version_mode,
+                ),
+            )
+            replay = cur.fetchone()
+            assert replay is not None
+
+            cur.execute(
+                """
+                INSERT INTO jobs(
+                    id, project_id, event_id, replay_execution_id, kind, status
+                )
+                VALUES (%s, %s, %s, %s, 'REPLAY_EVENT', 'PENDING')
+                RETURNING id, status
+                """,
+                (job_id, source["project_id"], event_id, replay_id),
+            )
+            job = cur.fetchone()
+            assert job is not None
+
+    return {
+        **replay,
+        "job_id": job["id"],
+        "job_status": job["status"],
+    }
+
+
+@app.get("/events/{event_id}/replays")
+def list_event_replays(
+    event_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+) -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM events WHERE id = %s", (event_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=404, detail="event not found")
+
+            cur.execute(
+                """
+                SELECT r.id, r.project_id, r.replay_of, r.workflow_version_mode,
+                       r.created_at, j.id AS job_id, j.status AS job_status,
+                       j.attempt_count, j.max_attempts, j.last_error, j.completed_at
+                FROM replay_executions AS r
+                JOIN jobs AS j ON j.replay_execution_id = r.id
+                WHERE r.replay_of = %s
+                ORDER BY r.created_at DESC
+                """,
+                (event_id,),
+            )
+            return list(cur.fetchall())
+
+
+@app.get("/projects/{project_id}/replays")
+def list_project_replays(
+    project_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    limit = max(1, min(limit, 200))
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.id, r.project_id, r.replay_of, r.workflow_version_mode,
+                       r.created_at, j.id AS job_id, j.status AS job_status,
+                       j.attempt_count, j.max_attempts, j.last_error, j.completed_at
+                FROM replay_executions AS r
+                JOIN jobs AS j ON j.replay_execution_id = r.id
+                WHERE r.project_id = %s
+                ORDER BY r.created_at DESC
+                LIMIT %s
+                """,
+                (project_id, limit),
+            )
+            return list(cur.fetchall())
+
+
+@app.get("/replays/{replay_id}")
+def get_replay(
+    replay_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+) -> dict[str, Any]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.id, r.project_id, r.replay_of, r.workflow_version_mode,
+                       r.created_at, j.id AS job_id, j.status AS job_status,
+                       j.attempt_count, j.max_attempts, j.available_at,
+                       j.lease_owner, j.lease_expires_at, j.last_error,
+                       j.completed_at
+                FROM replay_executions AS r
+                JOIN jobs AS j ON j.replay_execution_id = r.id
+                WHERE r.id = %s
+                """,
+                (replay_id,),
+            )
+            replay = cur.fetchone()
+    if replay is None:
+        raise HTTPException(status_code=404, detail="replay not found")
+    return replay
 
 
 @app.post("/ingest/{endpoint_token}", status_code=status.HTTP_202_ACCEPTED)

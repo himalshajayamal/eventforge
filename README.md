@@ -1,11 +1,68 @@
-# EventForge v0.2.0 — Reliable Jobs and Retries
+# EventForge v0.3.0 — ReplayDB
 
-EventForge is a local-first developer infrastructure platform. The v0.2.0
-milestone extends HookLedger with a durable PostgreSQL-backed job queue,
-worker leases, attempt history, retries, exponential backoff with jitter and
-dead-letter state.
+EventForge is a local-first developer infrastructure platform. The v0.3.0
+milestone adds ReplayDB: a historical event can create a new replay execution
+without changing the original event or payload.
 
-## Current runtime
+## Replay model
+
+```text
+original event ABC
+      |
+      | immutable historical record
+      v
+replay request
+      |
+      v
+replay execution XYZ
+      |
+      +-- replay_of = ABC
+      +-- workflow_version_mode = original | current
+      +-- REPLAY_EVENT job
+```
+
+Each replay gets a distinct `replay_executions.id` and its own reliable job.
+Repeated replays of the same source event are therefore independent executions.
+The source `events` row and `event_payloads` row are not cloned or rewritten.
+
+The engineering plan distinguishes replaying with the original workflow version
+from replaying with the current workflow version. v0.3 records that choice as
+`workflow_version_mode`. Workflow definitions and workflow versions do not exist
+until the next milestone, so v0.3 deliberately does not invent them early.
+
+Payloads remain in PostgreSQL in v0.3. The custom C event store is a later
+milestone.
+
+## API
+
+Create a replay:
+
+```text
+POST /events/{event_id}/replays
+```
+
+Body:
+
+```json
+{
+  "workflow_version_mode": "original"
+}
+```
+
+The other valid mode is `current`.
+
+Inspect replay history:
+
+```text
+GET /events/{event_id}/replays
+GET /projects/{project_id}/replays
+GET /replays/{replay_id}
+```
+
+Control-plane replay endpoints use the same Basic authentication as the existing
+project/event administration endpoints.
+
+## Runtime
 
 ```text
 Browser / webhook sender
@@ -18,34 +75,9 @@ React/Vite :5173     FastAPI :8000
                          ^
                          |
                     Python worker
+                         |
+             PROCESS_EVENT / REPLAY_EVENT
 ```
-
-A webhook is acknowledged only after its event and initial job commit. The
-worker then claims eligible jobs using PostgreSQL locking and records every
-attempt.
-
-## Job lifecycle
-
-```text
-PENDING
-   |
-   v
-RUNNING
-  |   \
-  |    \
-  v     v
-SUCCESS RETRY_WAIT
-          |
-          v
-       PENDING
-          |
-          v
-   DEAD_LETTERED  (when the attempt budget is exhausted)
-```
-
-A RUNNING job is owned through a time-bounded lease. If the worker disappears,
-another worker can recover the expired lease without allowing the stale worker
-to complete the job later.
 
 ## Local start
 
@@ -56,12 +88,6 @@ copy .env.example .env
 docker compose up -d --build
 ```
 
-Open:
-
-- Frontend: http://localhost:5173
-- API: http://localhost:8000
-- OpenAPI: http://localhost:8000/docs
-
 Verify:
 
 ```bat
@@ -69,29 +95,19 @@ curl http://localhost:8000/health
 curl http://localhost:8000/ready
 docker compose ps
 docker compose exec api python -m pytest -q
+docker compose exec web npm run build
 ```
 
-## Queue inspection
+## Replay inspection
 
 ```bat
-docker compose exec db psql -U eventforge -d eventforge -c "SELECT id, kind, status, attempt_count, max_attempts FROM jobs ORDER BY created_at DESC LIMIT 20;"
-docker compose exec db psql -U eventforge -d eventforge -c "SELECT job_id, attempt_number, worker_id, outcome FROM job_attempts ORDER BY started_at DESC LIMIT 20;"
+docker compose exec db psql -U eventforge -d eventforge -c "SELECT r.id, r.replay_of, r.workflow_version_mode, j.id AS job_id, j.status FROM replay_executions r JOIN jobs j ON j.replay_execution_id = r.id ORDER BY r.created_at DESC LIMIT 20;"
 docker compose logs worker --tail=50
-```
-
-## Native C/C++ build under WSL
-
-Keep Linux build artifacts on the native WSL filesystem:
-
-```bash
-cd /mnt/c/Users/himal/Desktop/Development
-cmake -S . -B ~/eventforge-build -G Ninja
-cmake --build ~/eventforge-build
-ctest --test-dir ~/eventforge-build --output-on-failure
 ```
 
 ## Current milestone boundary
 
-v0.2 implements reliable queue ownership and retry mechanics. It does not yet
-implement workflow actions, outbound side effects, ReplayDB, the C++ gateway or
-the C event store; those remain later milestones in the engineering plan.
+v0.3 implements replay execution identity, replay history, original/current
+workflow-version intent, durable replay jobs and reuse of the immutable source
+payload. It does not yet implement workflow definitions/actions, tracing, the
+C++ gateway or the C event store.

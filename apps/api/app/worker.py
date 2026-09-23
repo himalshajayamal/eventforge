@@ -66,9 +66,41 @@ def process_event_job(job: dict[str, Any]) -> None:
                 raise RuntimeError("event payload is missing")
 
 
+def process_replay_job(job: dict[str, Any]) -> None:
+    """Validate that a replay execution can read the immutable source payload.
+
+    v0.3 intentionally does not execute workflow steps yet; FlowTrace arrives in
+    v0.4. Completing this job proves that a distinct replay execution can be
+    scheduled from a historical event without rewriting the event or payload.
+    """
+    replay_execution_id = job.get("replay_execution_id")
+    if replay_execution_id is None:
+        raise RuntimeError("replay job is missing replay_execution_id")
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.id, r.replay_of, r.workflow_version_mode, p.sha256
+                FROM replay_executions AS r
+                JOIN events AS e ON e.id = r.replay_of
+                JOIN event_payloads AS p ON p.event_id = e.id
+                WHERE r.id = %s
+                  AND r.project_id = %s
+                  AND r.replay_of = %s
+                """,
+                (replay_execution_id, job["project_id"], job["event_id"]),
+            )
+            if cur.fetchone() is None:
+                raise RuntimeError("replay source event or payload is missing")
+
+
 def process_job(job: dict[str, Any]) -> None:
     if job["kind"] == "PROCESS_EVENT":
         process_event_job(job)
+        return
+    if job["kind"] == "REPLAY_EVENT":
+        process_replay_job(job)
         return
     raise RuntimeError(f"unsupported job kind: {job['kind']}")
 
@@ -92,7 +124,7 @@ def run() -> None:
         if promoted:
             log_record("INFO", "promote_due_retries", "promoted", count=promoted)
 
-        job = claim_job(WORKER_ID, lease_seconds=LEASE_SECONDS, kinds=("PROCESS_EVENT",))
+        job = claim_job(WORKER_ID, lease_seconds=LEASE_SECONDS, kinds=("PROCESS_EVENT", "REPLAY_EVENT"))
         if job is None:
             stop_event.wait(POLL_SECONDS)
             continue
@@ -103,6 +135,8 @@ def run() -> None:
             "job_id": job["id"],
             "attempt": job["attempt_count"],
         }
+        if job.get("replay_execution_id") is not None:
+            base_fields["replay_execution_id"] = job["replay_execution_id"]
         log_record("INFO", "job_claim", "claimed", **base_fields)
 
         try:
