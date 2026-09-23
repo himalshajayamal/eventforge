@@ -32,6 +32,21 @@ services:
       db:
         condition: service_healthy
 
+  worker:
+    build:
+      context: ./apps/api
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://eventforge:eventforge_dev_only@db:5432/eventforge}
+      EVENTFORGE_WORKER_POLL_SECONDS: ${EVENTFORGE_WORKER_POLL_SECONDS:-0.5}
+      EVENTFORGE_JOB_LEASE_SECONDS: ${EVENTFORGE_JOB_LEASE_SECONDS:-30}
+      EVENTFORGE_RETRY_BASE_SECONDS: ${EVENTFORGE_RETRY_BASE_SECONDS:-2}
+      EVENTFORGE_RETRY_MAX_SECONDS: ${EVENTFORGE_RETRY_MAX_SECONDS:-600}
+    depends_on:
+      db:
+        condition: service_healthy
+    stop_grace_period: 5s
+
   web:
     build:
       context: ./apps/web

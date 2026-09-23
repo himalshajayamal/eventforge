@@ -22,17 +22,26 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
-    defaults:
-      run:
-        working-directory: apps/api
+    env:
+      DATABASE_URL: postgresql://eventforge:eventforge_dev_only@localhost:5432/eventforge
+      PGPASSWORD: eventforge_dev_only
 
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
-      - run: pip install -r requirements.txt
-      - run: pytest -q
+      - name: Install Python dependencies
+        working-directory: apps/api
+        run: pip install -r requirements.txt
+      - name: Apply database migrations
+        run: |
+          for migration in database/migrations/*.sql; do
+            psql -h localhost -U eventforge -d eventforge -v ON_ERROR_STOP=1 -f "$migration"
+          done
+      - name: Run Python tests
+        working-directory: apps/api
+        run: python -m pytest -q
 
   native:
     runs-on: ubuntu-latest

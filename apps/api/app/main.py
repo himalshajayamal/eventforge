@@ -8,16 +8,13 @@ import psycopg
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://eventforge:eventforge_dev_only@localhost:5432/eventforge",
-)
+from app.db import db_connect
+
 ADMIN_USER = os.getenv("EVENTFORGE_ADMIN_USER", "eventforge")
 ADMIN_PASSWORD = os.getenv("EVENTFORGE_ADMIN_PASSWORD", "eventforge_dev_only_admin")
 MAX_INGEST_BYTES = int(os.getenv("EVENTFORGE_MAX_INGEST_BYTES", "1048576"))
@@ -25,7 +22,7 @@ MAX_INGEST_BYTES = int(os.getenv("EVENTFORGE_MAX_INGEST_BYTES", "1048576"))
 app = FastAPI(
     title="EventForge Control API",
     version=APP_VERSION,
-    description="v0.1 HookLedger reliable webhook ingestion",
+    description="v0.2 HookLedger reliable jobs and retries",
 )
 
 app.add_middleware(
@@ -47,9 +44,6 @@ class EndpointCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     source: str = Field(default="generic", min_length=1, max_length=80)
 
-
-def db_connect() -> psycopg.Connection[Any]:
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 def require_admin(
@@ -94,7 +88,7 @@ def root() -> dict[str, str]:
     return {
         "name": "EventForge",
         "version": APP_VERSION,
-        "status": "hookledger",
+        "status": "reliable-jobs",
     }
 
 
@@ -288,6 +282,100 @@ def get_event(
     if event is None:
         raise HTTPException(status_code=404, detail="event not found")
     return event
+
+
+
+
+@app.get("/projects/{project_id}/jobs")
+def list_jobs(
+    project_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+    job_status: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    limit = max(1, min(limit, 200))
+    if job_status is not None:
+        job_status = job_status.strip().upper()
+        allowed_statuses = {"PENDING", "RUNNING", "SUCCESS", "RETRY_WAIT", "DEAD_LETTERED"}
+        if job_status not in allowed_statuses:
+            raise HTTPException(status_code=400, detail="invalid job status")
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            if job_status is None:
+                cur.execute(
+                    """
+                    SELECT id, project_id, event_id, kind, status,
+                           attempt_count, max_attempts, available_at,
+                           lease_owner, lease_expires_at, last_error,
+                           created_at, updated_at, completed_at
+                    FROM jobs
+                    WHERE project_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (project_id, limit),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, project_id, event_id, kind, status,
+                           attempt_count, max_attempts, available_at,
+                           lease_owner, lease_expires_at, last_error,
+                           created_at, updated_at, completed_at
+                    FROM jobs
+                    WHERE project_id = %s AND status = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (project_id, job_status, limit),
+                )
+            return list(cur.fetchall())
+
+
+@app.get("/jobs/{job_id}")
+def get_job(
+    job_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+) -> dict[str, Any]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, project_id, event_id, kind, status,
+                       attempt_count, max_attempts, available_at,
+                       lease_owner, lease_token, lease_expires_at,
+                       last_error, created_at, updated_at, completed_at
+                FROM jobs
+                WHERE id = %s
+                """,
+                (job_id,),
+            )
+            job = cur.fetchone()
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
+
+
+@app.get("/jobs/{job_id}/attempts")
+def list_job_attempts(
+    job_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+) -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, project_id, job_id, event_id, attempt_number,
+                       worker_id, started_at, finished_at, outcome,
+                       error, retry_at
+                FROM job_attempts
+                WHERE job_id = %s
+                ORDER BY attempt_number ASC
+                """,
+                (job_id,),
+            )
+            return list(cur.fetchall())
 
 
 @app.post("/ingest/{endpoint_token}", status_code=status.HTTP_202_ACCEPTED)

@@ -1,56 +1,97 @@
-# EventForge v0.0 — Engineering Foundation
+# EventForge v0.2.0 — Reliable Jobs and Retries
 
-This repository is the first runnable EventForge baseline.
+EventForge is a local-first developer infrastructure platform. The v0.2.0
+milestone extends HookLedger with a durable PostgreSQL-backed job queue,
+worker leases, attempt history, retries, exponential backoff with jitter and
+dead-letter state.
 
-## What works
+## Current runtime
 
-- PostgreSQL 18.6
-- Python 3.14.7 + FastAPI 0.141.1
-- React 19.3.0 + TypeScript 7.0.2 + Vite 8.3.0
-- C17 build target
-- C++20 build target
-- Python tests
-- C/C++ smoke tests through CTest
-- Docker Compose startup
-- GitHub Actions CI skeleton
+```text
+Browser / webhook sender
+        |
+        v
+React/Vite :5173     FastAPI :8000
+                         |
+                         v
+                   PostgreSQL :5432
+                         ^
+                         |
+                    Python worker
+```
 
-## First run
+A webhook is acknowledged only after its event and initial job commit. The
+worker then claims eligible jobs using PostgreSQL locking and records every
+attempt.
 
-1. Install Git, Docker Desktop (or Docker Engine + Compose v2), and optionally CMake + a C/C++ compiler.
-2. Copy the environment file:
+## Job lifecycle
 
-   cp .env.example .env
+```text
+PENDING
+   |
+   v
+RUNNING
+  |   \
+  |    \
+  v     v
+SUCCESS RETRY_WAIT
+          |
+          v
+       PENDING
+          |
+          v
+   DEAD_LETTERED  (when the attempt budget is exhausted)
+```
 
-3. Start the local stack:
+A RUNNING job is owned through a time-bounded lease. If the worker disappears,
+another worker can recover the expired lease without allowing the stale worker
+to complete the job later.
 
-   docker compose up --build
+## Local start
 
-4. Open:
+On Windows Command Prompt:
 
-   - Frontend: http://localhost:5173
-   - API: http://localhost:8000
-   - API docs: http://localhost:8000/docs
+```bat
+copy .env.example .env
+docker compose up -d --build
+```
 
-5. Verify:
+Open:
 
-   curl http://localhost:8000/health
-   curl http://localhost:8000/ready
+- Frontend: http://localhost:5173
+- API: http://localhost:8000
+- OpenAPI: http://localhost:8000/docs
 
-## Native C/C++ build
+Verify:
 
-mkdir -p build
-cmake -S . -B build
-cmake --build build
-ctest --test-dir build --output-on-failure
+```bat
+curl http://localhost:8000/health
+curl http://localhost:8000/ready
+docker compose ps
+docker compose exec api python -m pytest -q
+```
 
-## Stop
+## Queue inspection
 
-docker compose down
+```bat
+docker compose exec db psql -U eventforge -d eventforge -c "SELECT id, kind, status, attempt_count, max_attempts FROM jobs ORDER BY created_at DESC LIMIT 20;"
+docker compose exec db psql -U eventforge -d eventforge -c "SELECT job_id, attempt_number, worker_id, outcome FROM job_attempts ORDER BY started_at DESC LIMIT 20;"
+docker compose logs worker --tail=50
+```
 
-To also delete the local database volume:
+## Native C/C++ build under WSL
 
-docker compose down -v
+Keep Linux build artifacts on the native WSL filesystem:
 
-## v0.0 exit criterion
+```bash
+cd /mnt/c/Users/himal/Desktop/Development
+cmake -S . -B ~/eventforge-build -G Ninja
+cmake --build ~/eventforge-build
+ctest --test-dir ~/eventforge-build --output-on-failure
+```
 
-A clean checkout can start the frontend, API, and PostgreSQL locally and all baseline tests pass.
+## Current milestone boundary
+
+v0.2 implements reliable queue ownership and retry mechanics. It does not yet
+implement workflow actions, outbound side effects, ReplayDB, the C++ gateway or
+the C event store; those remain later milestones in the engineering plan.
