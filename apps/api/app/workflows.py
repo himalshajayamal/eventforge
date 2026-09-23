@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
 import socket
 import ssl
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 from typing import Any
 
@@ -20,15 +19,55 @@ from app.db import db_connect
 HTTP_RESPONSE_LIMIT = int(os.getenv("EVENTFORGE_HTTP_ACTION_MAX_RESPONSE_BYTES", "1048576"))
 ALLOW_PRIVATE_HTTP = os.getenv("EVENTFORGE_ALLOW_PRIVATE_HTTP_ACTIONS", "0") == "1"
 ALLOW_INSECURE_HTTP = os.getenv("EVENTFORGE_ALLOW_INSECURE_HTTP_ACTIONS", "0") == "1"
+HTTP_ALLOWED_PORTS = {
+    int(value.strip())
+    for value in os.getenv("EVENTFORGE_HTTP_ACTION_ALLOWED_PORTS", "443").split(",")
+    if value.strip()
+}
+BLOCKED_HTTP_HOSTNAMES = {
+    "localhost",
+    "metadata.google.internal",
+    "metadata.azure.internal",
+    "metadata",
+}
 
 
 class WorkflowActionError(RuntimeError):
     pass
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
-        return None
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, hostname: str, port: int, resolved_ip: str, timeout: float):
+        super().__init__(hostname, port=port, timeout=timeout)
+        self._resolved_ip = resolved_ip
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(
+            (self._resolved_ip, self.port),
+            self.timeout,
+            self.source_address,
+        )
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(
+        self,
+        hostname: str,
+        port: int,
+        resolved_ip: str,
+        timeout: float,
+        context: ssl.SSLContext,
+    ):
+        super().__init__(hostname, port=port, timeout=timeout, context=context)
+        self._resolved_ip = resolved_ip
+
+    def connect(self) -> None:
+        raw_sock = socket.create_connection(
+            (self._resolved_ip, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        self.sock = self._context.wrap_socket(raw_sock, server_hostname=self.host)
 
 
 def _json_context_for_event(event_id: uuid.UUID) -> dict[str, Any]:
@@ -97,6 +136,41 @@ def _is_disallowed_ip(address: str) -> bool:
     )
 
 
+def _resolve_http_addresses(parsed: urllib.parse.SplitResult) -> list[str]:
+    assert parsed.hostname is not None
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname in BLOCKED_HTTP_HOSTNAMES or hostname.endswith(".localhost"):
+        raise WorkflowActionError("http_request target hostname is blocked")
+
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal = None
+
+    if literal is not None:
+        addresses = [str(literal)]
+    else:
+        try:
+            addresses = sorted({
+                result[4][0]
+                for result in socket.getaddrinfo(
+                    hostname,
+                    parsed.port or (443 if parsed.scheme.lower() == "https" else 80),
+                    type=socket.SOCK_STREAM,
+                )
+            })
+        except socket.gaierror as exc:
+            raise WorkflowActionError("http_request hostname could not be resolved") from exc
+
+    if not addresses:
+        raise WorkflowActionError("http_request hostname did not resolve")
+    if not ALLOW_PRIVATE_HTTP:
+        for address in addresses:
+            if _is_disallowed_ip(address):
+                raise WorkflowActionError("http_request target resolves to a private or local address")
+    return addresses
+
+
 def validate_http_target(url: str) -> urllib.parse.SplitResult:
     parsed = urllib.parse.urlsplit(url)
     allowed_schemes = {"https"}
@@ -108,21 +182,14 @@ def validate_http_target(url: str) -> urllib.parse.SplitResult:
         raise WorkflowActionError("http_request URL requires a hostname")
     if parsed.username or parsed.password:
         raise WorkflowActionError("userinfo is not allowed in http_request URLs")
+    if parsed.fragment:
+        raise WorkflowActionError("URL fragments are not allowed in http_request URLs")
 
-    if not ALLOW_PRIVATE_HTTP:
-        try:
-            addresses = {
-                result[4][0]
-                for result in socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)
-            }
-        except socket.gaierror as exc:
-            raise WorkflowActionError("http_request hostname could not be resolved") from exc
-        if not addresses:
-            raise WorkflowActionError("http_request hostname did not resolve")
-        for address in addresses:
-            if _is_disallowed_ip(address):
-                raise WorkflowActionError("http_request target resolves to a private or local address")
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    if port not in HTTP_ALLOWED_PORTS:
+        raise WorkflowActionError("http_request target port is not allowed")
 
+    _resolve_http_addresses(parsed)
     return parsed
 
 
@@ -132,13 +199,14 @@ def execute_http_request(config: dict[str, Any], context: dict[str, Any], step_r
         raise WorkflowActionError("http_request method must be GET or POST")
 
     url = str(config.get("url", ""))
-    validate_http_target(url)
+    parsed = validate_http_target(url)
+    addresses = _resolve_http_addresses(parsed)
     timeout_seconds = float(config.get("timeout_seconds", 5.0))
     if timeout_seconds <= 0 or timeout_seconds > 10:
         raise WorkflowActionError("http_request timeout must be between 0 and 10 seconds")
 
     headers = {
-        "User-Agent": "EventForge/0.5.0",
+        "User-Agent": "EventForge/0.6.0",
         "Accept": "application/json, */*;q=0.8",
         "Idempotency-Key": str(step_run_id),
     }
@@ -147,25 +215,48 @@ def execute_http_request(config: dict[str, Any], context: dict[str, Any], step_r
         body = json.dumps(context, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
 
-    request = urllib.request.Request(url, data=body, headers=headers, method=method)
-    opener = urllib.request.build_opener(_NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+    hostname = parsed.hostname
+    assert hostname is not None
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    resolved_ip = addresses[0]
+    target = parsed.path or "/"
+    if parsed.query:
+        target += "?" + parsed.query
+
+    if parsed.scheme.lower() == "https":
+        conn: http.client.HTTPConnection = _PinnedHTTPSConnection(
+            hostname,
+            port,
+            resolved_ip,
+            timeout_seconds,
+            ssl.create_default_context(),
+        )
+    else:
+        conn = _PinnedHTTPConnection(hostname, port, resolved_ip, timeout_seconds)
+
     try:
-        with opener.open(request, timeout=timeout_seconds) as response:
-            data = response.read(HTTP_RESPONSE_LIMIT + 1)
-            if len(data) > HTTP_RESPONSE_LIMIT:
-                raise WorkflowActionError("http_request response exceeded size limit")
-            if not 200 <= response.status < 300:
-                raise WorkflowActionError(f"http_request returned status {response.status}")
-            return {
-                "status_code": response.status,
-                "response_size": len(data),
-                "content_type": response.headers.get("content-type"),
-                "sha256": hashlib.sha256(data).hexdigest(),
-            }
-    except urllib.error.HTTPError as exc:
-        raise WorkflowActionError(f"http_request returned status {exc.code}") from exc
-    except urllib.error.URLError as exc:
-        raise WorkflowActionError(f"http_request failed: {exc.reason}") from exc
+        conn.request(method, target, body=body, headers=headers)
+        response = conn.getresponse()
+        data = response.read(HTTP_RESPONSE_LIMIT + 1)
+        if len(data) > HTTP_RESPONSE_LIMIT:
+            raise WorkflowActionError("http_request response exceeded size limit")
+        if 300 <= response.status < 400:
+            raise WorkflowActionError("http_request redirects are not followed")
+        if not 200 <= response.status < 300:
+            raise WorkflowActionError(f"http_request returned status {response.status}")
+        return {
+            "status_code": response.status,
+            "response_size": len(data),
+            "content_type": response.headers.get("content-type"),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "resolved_ip": resolved_ip,
+        }
+    except WorkflowActionError:
+        raise
+    except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+        raise WorkflowActionError(f"http_request failed: {exc}") from exc
+    finally:
+        conn.close()
 
 
 def snapshot_replay_workflow_selections(

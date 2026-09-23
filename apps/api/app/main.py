@@ -1,29 +1,39 @@
 import hashlib
+import hmac
 import os
 import secrets
+import time
 import uuid
 from typing import Annotated, Any, Literal, Union
 
 import psycopg
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 
 from app.db import db_connect
+from app.security import (
+    ADMIN_PASSWORD,
+    ADMIN_USER,
+    REQUIRE_SIGNED_WEBHOOKS,
+    derive_webhook_signing_secret,
+    generate_project_api_key,
+    require_admin,
+    require_control_access,
+    security_middleware,
+    token_hash,
+)
 from app.workflows import schedule_workflows_for_event, snapshot_replay_workflow_selections
 
-ADMIN_USER = os.getenv("EVENTFORGE_ADMIN_USER", "eventforge")
-ADMIN_PASSWORD = os.getenv("EVENTFORGE_ADMIN_PASSWORD", "eventforge_dev_only_admin")
 MAX_INGEST_BYTES = int(os.getenv("EVENTFORGE_MAX_INGEST_BYTES", "1048576"))
 
 app = FastAPI(
     title="EventForge Control API",
     version=APP_VERSION,
-    description="v0.5 integrated HookLedger + ReplayDB + FlowTrace core",
+    description="v0.6 security-hardened HookLedger + ReplayDB + FlowTrace core",
 )
 
 app.add_middleware(
@@ -33,8 +43,7 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
-
-basic_auth = HTTPBasic(auto_error=False)
+app.middleware("http")(security_middleware)
 
 
 class ProjectCreate(BaseModel):
@@ -44,6 +53,12 @@ class ProjectCreate(BaseModel):
 class EndpointCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     source: str = Field(default="generic", min_length=1, max_length=80)
+    verify_signature: bool = False
+    signature_tolerance_seconds: int = Field(default=300, ge=30, le=3600)
+
+
+class ProjectApiKeyCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
 
 
 class ReplayCreate(BaseModel):
@@ -103,29 +118,6 @@ class WorkflowVersionCreate(BaseModel):
 
 
 
-def require_admin(
-    credentials: Annotated[HTTPBasicCredentials | None, Depends(basic_auth)],
-) -> None:
-    if credentials is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="authentication required",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-
-    username_ok = secrets.compare_digest(credentials.username, ADMIN_USER)
-    password_ok = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
-    if not (username_ok and password_ok):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="invalid credentials",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-
-
-def token_hash(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
 
 def safe_ingest_headers(request: Request) -> dict[str, str]:
     allowed = {
@@ -145,7 +137,7 @@ def root() -> dict[str, str]:
     return {
         "name": "EventForge",
         "version": APP_VERSION,
-        "status": "integrated-core",
+        "status": "security-hardened",
     }
 
 
@@ -195,6 +187,81 @@ def create_project(
     return project
 
 
+@app.post("/projects/{project_id}/api-keys", status_code=status.HTTP_201_CREATED)
+def create_project_api_key(
+    project_id: uuid.UUID,
+    payload: ProjectApiKeyCreate,
+    _: Annotated[None, Depends(require_admin)],
+) -> dict[str, Any]:
+    key_name = payload.name.strip()
+    if not key_name:
+        raise HTTPException(status_code=422, detail="API key name cannot be blank")
+    api_key = generate_project_api_key()
+    api_key_id = uuid.uuid4()
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM projects WHERE id = %s", (project_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=404, detail="project not found")
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO project_api_keys(id, project_id, name, key_prefix, key_hash)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING id, project_id, name, key_prefix, created_at, last_used_at, revoked_at
+                    """,
+                    (api_key_id, project_id, key_name, api_key[:12], token_hash(api_key)),
+                )
+                row = cur.fetchone()
+            except psycopg.errors.UniqueViolation as exc:
+                raise HTTPException(status_code=409, detail="an API key with this name already exists") from exc
+    assert row is not None
+    row["api_key"] = api_key
+    row["token_note"] = "This API key is shown once. EventForge stores only its SHA-256 hash."
+    return row
+
+
+@app.get("/projects/{project_id}/api-keys")
+def list_project_api_keys(
+    project_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+) -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, project_id, name, key_prefix, created_at, last_used_at, revoked_at
+                FROM project_api_keys
+                WHERE project_id = %s
+                ORDER BY created_at DESC
+                """,
+                (project_id,),
+            )
+            return list(cur.fetchall())
+
+
+@app.post("/project-api-keys/{api_key_id}/revoke")
+def revoke_project_api_key(
+    api_key_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+) -> dict[str, Any]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE project_api_keys
+                SET revoked_at = COALESCE(revoked_at, now())
+                WHERE id = %s
+                RETURNING id, project_id, name, key_prefix, created_at, last_used_at, revoked_at
+                """,
+                (api_key_id,),
+            )
+            row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="API key not found")
+    return row
+
+
 @app.post(
     "/projects/{project_id}/webhook-endpoints",
     status_code=status.HTTP_201_CREATED,
@@ -202,13 +269,14 @@ def create_project(
 def create_webhook_endpoint(
     project_id: uuid.UUID,
     payload: EndpointCreate,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> dict[str, Any]:
     endpoint_id = uuid.uuid4()
     endpoint_token = secrets.token_urlsafe(32)
     endpoint_token_hash = token_hash(endpoint_token)
     endpoint_name = payload.name.strip()
     source = payload.source.strip().lower()
+    verify_signature = payload.verify_signature or REQUIRE_SIGNED_WEBHOOKS
 
     if not endpoint_name or not source:
         raise HTTPException(status_code=422, detail="name and source cannot be blank")
@@ -223,10 +291,13 @@ def create_webhook_endpoint(
                 cur.execute(
                     """
                     INSERT INTO ingress_endpoints(
-                        id, project_id, name, source, token_prefix, token_hash
+                        id, project_id, name, source, token_prefix, token_hash,
+                        verify_signature, signature_tolerance_seconds
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    RETURNING id, project_id, name, source, token_prefix, enabled, created_at
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id, project_id, name, source, token_prefix, enabled,
+                              verify_signature, signing_secret_version,
+                              signature_tolerance_seconds, created_at
                     """,
                     (
                         endpoint_id,
@@ -235,6 +306,8 @@ def create_webhook_endpoint(
                         source,
                         endpoint_token[:8],
                         endpoint_token_hash,
+                        verify_signature,
+                        payload.signature_tolerance_seconds,
                     ),
                 )
                 endpoint = cur.fetchone()
@@ -246,22 +319,35 @@ def create_webhook_endpoint(
 
     assert endpoint is not None
     endpoint["endpoint_token"] = endpoint_token
-    endpoint["ingest_path"] = f"/ingest/{endpoint_token}"
-    endpoint["token_note"] = "This token is shown once. EventForge stores only its SHA-256 hash."
+    endpoint["ingest_path"] = "/ingest"
+    endpoint["legacy_ingest_path"] = f"/ingest/{endpoint_token}"
+    endpoint["token_note"] = (
+        "This token is shown once. Prefer X-EventForge-Endpoint-Token with POST /ingest; "
+        "EventForge stores only its SHA-256 hash."
+    )
+    if endpoint["verify_signature"]:
+        endpoint["signing_secret"] = derive_webhook_signing_secret(
+            endpoint["id"], endpoint["signing_secret_version"]
+        )
+        endpoint["signature_note"] = (
+            "This signing secret is derived from the server master secret and shown for webhook setup. "
+            "Rotate it if it is exposed."
+        )
     return endpoint
 
 
 @app.get("/projects/{project_id}/webhook-endpoints")
 def list_webhook_endpoints(
     project_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> list[dict[str, Any]]:
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT id, project_id, name, source, token_prefix, enabled,
-                       created_at, last_received_at
+                       verify_signature, signing_secret_version,
+                       signature_tolerance_seconds, created_at, last_received_at
                 FROM ingress_endpoints
                 WHERE project_id = %s
                 ORDER BY created_at DESC
@@ -271,10 +357,61 @@ def list_webhook_endpoints(
             return list(cur.fetchall())
 
 
+@app.post("/webhook-endpoints/{endpoint_id}/rotate-signing-secret")
+def rotate_webhook_signing_secret(
+    endpoint_id: uuid.UUID,
+    _: Annotated[None, Depends(require_control_access)],
+) -> dict[str, Any]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE ingress_endpoints
+                SET verify_signature = true,
+                    signing_secret_version = signing_secret_version + 1
+                WHERE id = %s
+                RETURNING id, project_id, name, source, verify_signature,
+                          signing_secret_version, signature_tolerance_seconds
+                """,
+                (endpoint_id,),
+            )
+            endpoint = cur.fetchone()
+    if endpoint is None:
+        raise HTTPException(status_code=404, detail="webhook endpoint not found")
+    endpoint["signing_secret"] = derive_webhook_signing_secret(
+        endpoint["id"], endpoint["signing_secret_version"]
+    )
+    endpoint["signature_note"] = "Replace the old provider secret; previous signatures no longer validate."
+    return endpoint
+
+
+@app.get("/webhook-endpoints/{endpoint_id}/ingress-attempts")
+def list_endpoint_ingress_attempts(
+    endpoint_id: uuid.UUID,
+    _: Annotated[None, Depends(require_control_access)],
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    limit = max(1, min(limit, 200))
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, project_id, endpoint_id, event_id, provider_delivery_id,
+                       request_id, outcome, response_code, received_at
+                FROM ingress_attempts
+                WHERE endpoint_id = %s
+                ORDER BY received_at DESC
+                LIMIT %s
+                """,
+                (endpoint_id, limit),
+            )
+            return list(cur.fetchall())
+
+
 @app.get("/projects/{project_id}/events")
 def list_events(
     project_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
     limit: int = 50,
 ) -> list[dict[str, Any]]:
     limit = max(1, min(limit, 200))
@@ -299,7 +436,7 @@ def list_events(
 @app.get("/events/{event_id}/ingress-attempts")
 def list_ingress_attempts(
     event_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> list[dict[str, Any]]:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -319,7 +456,7 @@ def list_ingress_attempts(
 @app.get("/events/{event_id}")
 def get_event(
     event_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> dict[str, Any]:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -344,7 +481,7 @@ def get_event(
 @app.get("/events/{event_id}/integration")
 def get_event_integration(
     event_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> dict[str, Any]:
     """Return one cross-product view for HookLedger, FlowTrace and ReplayDB."""
     with db_connect() as conn:
@@ -434,7 +571,7 @@ def get_event_integration(
 @app.get("/projects/{project_id}/jobs")
 def list_jobs(
     project_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
     job_status: str | None = None,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
@@ -481,7 +618,7 @@ def list_jobs(
 @app.get("/jobs/{job_id}")
 def get_job(
     job_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> dict[str, Any]:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -505,7 +642,7 @@ def get_job(
 @app.get("/jobs/{job_id}/attempts")
 def list_job_attempts(
     job_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> list[dict[str, Any]]:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -530,7 +667,7 @@ def list_job_attempts(
 def create_replay(
     event_id: uuid.UUID,
     payload: ReplayCreate,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> dict[str, Any]:
     """Create a replay and freeze its FlowTrace workflow-version selection.
 
@@ -615,7 +752,7 @@ def create_replay(
 @app.get("/events/{event_id}/replays")
 def list_event_replays(
     event_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> list[dict[str, Any]]:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -641,7 +778,7 @@ def list_event_replays(
 @app.get("/projects/{project_id}/replays")
 def list_project_replays(
     project_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
     limit: int = 50,
 ) -> list[dict[str, Any]]:
     limit = max(1, min(limit, 200))
@@ -666,7 +803,7 @@ def list_project_replays(
 @app.get("/replays/{replay_id}")
 def get_replay(
     replay_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> dict[str, Any]:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -692,7 +829,7 @@ def get_replay(
 @app.get("/replays/{replay_id}/workflow-selections")
 def list_replay_workflow_selections(
     replay_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> list[dict[str, Any]]:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -727,7 +864,7 @@ def _workflow_definition(trigger: WorkflowTrigger, steps: list[WorkflowStep]) ->
 def create_workflow(
     project_id: uuid.UUID,
     payload: WorkflowCreate,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> dict[str, Any]:
     workflow_id = uuid.uuid4()
     version_id = uuid.uuid4()
@@ -799,7 +936,7 @@ def create_workflow(
 def create_workflow_version(
     workflow_id: uuid.UUID,
     payload: WorkflowVersionCreate,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> dict[str, Any]:
     version_id = uuid.uuid4()
     trigger_source = payload.trigger.source.strip().lower()
@@ -859,7 +996,7 @@ def create_workflow_version(
 def activate_workflow_version(
     workflow_id: uuid.UUID,
     version_number: int,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> dict[str, Any]:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -892,7 +1029,7 @@ def activate_workflow_version(
 @app.get("/projects/{project_id}/workflows")
 def list_workflows(
     project_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> list[dict[str, Any]]:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -915,7 +1052,7 @@ def list_workflows(
 @app.get("/workflows/{workflow_id}")
 def get_workflow(
     workflow_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> dict[str, Any]:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -940,7 +1077,7 @@ def get_workflow(
 @app.get("/workflows/{workflow_id}/versions")
 def list_workflow_versions(
     workflow_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> list[dict[str, Any]]:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -962,7 +1099,7 @@ def list_workflow_versions(
 @app.get("/projects/{project_id}/workflow-runs")
 def list_workflow_runs(
     project_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
     limit: int = 50,
 ) -> list[dict[str, Any]]:
     limit = max(1, min(limit, 200))
@@ -987,7 +1124,7 @@ def list_workflow_runs(
 @app.get("/workflow-runs/{run_id}")
 def get_workflow_run(
     run_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> dict[str, Any]:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -1012,7 +1149,7 @@ def get_workflow_run(
 @app.get("/workflow-runs/{run_id}/steps")
 def list_workflow_steps(
     run_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> list[dict[str, Any]]:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -1032,7 +1169,7 @@ def list_workflow_steps(
 @app.post("/events/{event_id}/workflow-runs", status_code=status.HTTP_202_ACCEPTED)
 def schedule_event_workflows(
     event_id: uuid.UUID,
-    _: Annotated[None, Depends(require_admin)],
+    _: Annotated[None, Depends(require_control_access)],
 ) -> dict[str, Any]:
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -1044,10 +1181,87 @@ def schedule_event_workflows(
     return {"event_id": event_id, "scheduled_run_ids": run_ids}
 
 
-@app.post("/ingest/{endpoint_token}", status_code=status.HTTP_202_ACCEPTED)
-async def ingest_webhook(endpoint_token: str, request: Request) -> dict[str, Any]:
+def _load_ingress_endpoint(endpoint_token: str) -> dict[str, Any]:
     if len(endpoint_token) < 20 or len(endpoint_token) > 200:
         raise HTTPException(status_code=404, detail="endpoint not found")
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, project_id, source, verify_signature,
+                       signing_secret_version, signature_tolerance_seconds
+                FROM ingress_endpoints
+                WHERE token_hash = %s AND enabled = true
+                """,
+                (token_hash(endpoint_token),),
+            )
+            endpoint = cur.fetchone()
+    if endpoint is None:
+        raise HTTPException(status_code=404, detail="endpoint not found")
+    return endpoint
+
+
+def _signature_hex(value: str | None) -> str | None:
+    if value is None or not value.startswith("sha256="):
+        return None
+    candidate = value[7:].strip().lower()
+    if len(candidate) != 64 or any(ch not in "0123456789abcdef" for ch in candidate):
+        return None
+    return candidate
+
+
+def _webhook_signature_valid(endpoint: dict[str, Any], request: Request, body: bytes) -> bool:
+    if not endpoint["verify_signature"]:
+        return True
+
+    secret = derive_webhook_signing_secret(
+        endpoint["id"], endpoint["signing_secret_version"]
+    ).encode("utf-8")
+
+    eventforge_signature = _signature_hex(request.headers.get("x-eventforge-signature"))
+    timestamp = request.headers.get("x-eventforge-timestamp")
+    if eventforge_signature is not None and timestamp is not None:
+        try:
+            timestamp_seconds = int(timestamp)
+        except ValueError:
+            return False
+        if abs(int(time.time()) - timestamp_seconds) > endpoint["signature_tolerance_seconds"]:
+            return False
+        signed = timestamp.encode("ascii") + b"." + body
+        expected = hmac.new(secret, signed, hashlib.sha256).hexdigest()
+        return secrets.compare_digest(eventforge_signature, expected)
+
+    if endpoint["source"] == "github":
+        github_signature = _signature_hex(request.headers.get("x-hub-signature-256"))
+        if github_signature is not None:
+            expected = hmac.new(secret, body, hashlib.sha256).hexdigest()
+            return secrets.compare_digest(github_signature, expected)
+
+    return False
+
+
+def _record_signature_rejection(
+    *,
+    endpoint: dict[str, Any],
+    request_id: uuid.UUID,
+    delivery_id: str | None,
+) -> None:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO ingress_attempts(
+                    id, project_id, endpoint_id, event_id,
+                    provider_delivery_id, request_id, outcome, response_code
+                )
+                VALUES (%s, %s, %s, NULL, %s, %s, 'REJECTED_SIGNATURE', 401)
+                """,
+                (uuid.uuid4(), endpoint["project_id"], endpoint["id"], delivery_id, request_id),
+            )
+
+
+async def _ingest_webhook(endpoint_token: str, request: Request) -> dict[str, Any]:
+    endpoint = _load_ingress_endpoint(endpoint_token)
 
     content_length = request.headers.get("content-length")
     if content_length is not None:
@@ -1066,7 +1280,6 @@ async def ingest_webhook(endpoint_token: str, request: Request) -> dict[str, Any
     candidate_trace_id = uuid.uuid4()
     candidate_job_id = uuid.uuid4()
     attempt_id = uuid.uuid4()
-    endpoint_token_hash = token_hash(endpoint_token)
 
     delivery_id = (
         request.headers.get("x-github-delivery")
@@ -1077,6 +1290,14 @@ async def ingest_webhook(endpoint_token: str, request: Request) -> dict[str, Any
         delivery_id = delivery_id.strip()
         if not delivery_id or len(delivery_id) > 255:
             raise HTTPException(status_code=400, detail="invalid delivery id")
+
+    if not _webhook_signature_valid(endpoint, request, body):
+        _record_signature_rejection(
+            endpoint=endpoint,
+            request_id=request_id,
+            delivery_id=delivery_id,
+        )
+        raise HTTPException(status_code=401, detail="invalid webhook signature")
 
     event_type = (
         request.headers.get("x-github-event")
@@ -1092,18 +1313,6 @@ async def ingest_webhook(endpoint_token: str, request: Request) -> dict[str, Any
 
     with db_connect() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, project_id, source
-                FROM ingress_endpoints
-                WHERE token_hash = %s AND enabled = true
-                """,
-                (endpoint_token_hash,),
-            )
-            endpoint = cur.fetchone()
-            if endpoint is None:
-                raise HTTPException(status_code=404, detail="endpoint not found")
-
             cur.execute(
                 """
                 INSERT INTO events(
@@ -1227,3 +1436,16 @@ async def ingest_webhook(endpoint_token: str, request: Request) -> dict[str, Any
     # psycopg commits when the connection context exits successfully. Returning
     # only here guarantees the 202 response is sent after durable DB commit.
     return result
+
+
+@app.post("/ingest", status_code=status.HTTP_202_ACCEPTED)
+async def ingest_webhook_header(request: Request) -> dict[str, Any]:
+    endpoint_token = request.headers.get("x-eventforge-endpoint-token", "")
+    return await _ingest_webhook(endpoint_token, request)
+
+
+@app.post("/ingest/{endpoint_token}", status_code=status.HTTP_202_ACCEPTED)
+async def ingest_webhook(endpoint_token: str, request: Request) -> dict[str, Any]:
+    # Compatibility route retained for v0.x. Access logging is disabled because
+    # this legacy path contains a secret. New clients should use POST /ingest.
+    return await _ingest_webhook(endpoint_token, request)

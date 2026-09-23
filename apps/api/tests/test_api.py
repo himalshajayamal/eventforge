@@ -1,7 +1,10 @@
+import hashlib
+import hmac
 import json
 import time
 import uuid
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.db import db_connect
@@ -15,8 +18,14 @@ from app.jobs import (
     retry_delay_seconds,
 )
 from app.main import ADMIN_PASSWORD, ADMIN_USER, app
+from app.security import DEV_ADMIN_PASSWORD, DEV_WEBHOOK_MASTER_SECRET, validate_runtime_security
 from app.worker import process_event_job, process_replay_job
-from app.workflows import process_workflow_step_job, schedule_workflows_for_event
+from app.workflows import (
+    WorkflowActionError,
+    process_workflow_step_job,
+    schedule_workflows_for_event,
+    validate_http_target,
+)
 
 client = TestClient(app)
 ADMIN_AUTH = (ADMIN_USER, ADMIN_PASSWORD)
@@ -123,8 +132,8 @@ def test_health() -> None:
 def test_root_version() -> None:
     response = client.get("/")
     assert response.status_code == 200
-    assert response.json()["version"] == "0.5.0"
-    assert response.json()["status"] == "integrated-core"
+    assert response.json()["version"] == "0.6.0"
+    assert response.json()["status"] == "security-hardened"
 
 
 def test_control_plane_requires_authentication() -> None:
@@ -936,3 +945,215 @@ def test_replay_zero_selection_remains_frozen_after_workflow_is_created() -> Non
             row = cur.fetchone()
     assert row is not None
     assert row["count"] == 0
+
+
+def test_project_api_key_is_scoped_hashed_and_revocable() -> None:
+    suffix = uuid.uuid4().hex
+    project_a = client.post(
+        "/projects", auth=ADMIN_AUTH, json={"name": f"security-a-{suffix}"}
+    ).json()
+    project_b = client.post(
+        "/projects", auth=ADMIN_AUTH, json={"name": f"security-b-{suffix}"}
+    ).json()
+
+    created = client.post(
+        f"/projects/{project_a['id']}/api-keys",
+        auth=ADMIN_AUTH,
+        json={"name": "automation"},
+    )
+    assert created.status_code == 201
+    body = created.json()
+    api_key = body["api_key"]
+    assert api_key.startswith("efk_")
+    assert api_key not in body["key_prefix"]
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT key_hash, revoked_at FROM project_api_keys WHERE id = %s",
+                (body["id"],),
+            )
+            stored = cur.fetchone()
+    assert stored is not None
+    assert stored["key_hash"] == hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    assert api_key != stored["key_hash"]
+    assert stored["revoked_at"] is None
+
+    bearer = {"Authorization": f"Bearer {api_key}"}
+    own = client.get(f"/projects/{project_a['id']}/events", headers=bearer)
+    assert own.status_code == 200
+
+    cross_project = client.get(f"/projects/{project_b['id']}/events", headers=bearer)
+    assert cross_project.status_code == 404
+
+    revoke = client.post(f"/project-api-keys/{body['id']}/revoke", auth=ADMIN_AUTH)
+    assert revoke.status_code == 200
+    assert revoke.json()["revoked_at"] is not None
+
+    revoked = client.get(f"/projects/{project_a['id']}/events", headers=bearer)
+    assert revoked.status_code == 401
+
+
+def test_signed_webhook_requires_valid_fresh_hmac_and_header_token() -> None:
+    suffix = uuid.uuid4().hex
+    project = client.post(
+        "/projects", auth=ADMIN_AUTH, json={"name": f"signed-webhook-{suffix}"}
+    ).json()
+    endpoint_response = client.post(
+        f"/projects/{project['id']}/webhook-endpoints",
+        auth=ADMIN_AUTH,
+        json={
+            "name": f"signed-{suffix}",
+            "source": "generic",
+            "verify_signature": True,
+            "signature_tolerance_seconds": 300,
+        },
+    )
+    assert endpoint_response.status_code == 201
+    endpoint = endpoint_response.json()
+    secret = endpoint["signing_secret"].encode("utf-8")
+    payload = b'{"secure":true}'
+    timestamp = str(int(time.time()))
+    signature = hmac.new(
+        secret,
+        timestamp.encode("ascii") + b"." + payload,
+        hashlib.sha256,
+    ).hexdigest()
+
+    headers = {
+        "X-EventForge-Endpoint-Token": endpoint["endpoint_token"],
+        "X-EventForge-Timestamp": timestamp,
+        "X-EventForge-Signature": f"sha256={signature}",
+        "X-EventForge-Delivery-ID": f"signed-{suffix}",
+        "X-EventForge-Event-Type": "security.signed",
+        "Content-Type": "application/json",
+    }
+    accepted = client.post("/ingest", headers=headers, content=payload)
+    assert accepted.status_code == 202
+    event_id = accepted.json()["event_id"]
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT headers FROM events WHERE id = %s", (event_id,))
+            stored_event = cur.fetchone()
+    assert stored_event is not None
+    assert "x-eventforge-signature" not in stored_event["headers"]
+    assert "x-eventforge-timestamp" not in stored_event["headers"]
+
+    bad_headers = dict(headers)
+    bad_headers["X-EventForge-Delivery-ID"] = f"bad-{suffix}"
+    bad_headers["X-EventForge-Signature"] = "sha256=" + ("0" * 64)
+    bad = client.post("/ingest", headers=bad_headers, content=payload)
+    assert bad.status_code == 401
+
+    stale_timestamp = str(int(time.time()) - 1000)
+    stale_signature = hmac.new(
+        secret,
+        stale_timestamp.encode("ascii") + b"." + payload,
+        hashlib.sha256,
+    ).hexdigest()
+    stale_headers = dict(headers)
+    stale_headers["X-EventForge-Delivery-ID"] = f"stale-{suffix}"
+    stale_headers["X-EventForge-Timestamp"] = stale_timestamp
+    stale_headers["X-EventForge-Signature"] = f"sha256={stale_signature}"
+    stale = client.post("/ingest", headers=stale_headers, content=payload)
+    assert stale.status_code == 401
+
+    attempts = client.get(
+        f"/webhook-endpoints/{endpoint['id']}/ingress-attempts",
+        auth=ADMIN_AUTH,
+    )
+    assert attempts.status_code == 200
+    outcomes = [item["outcome"] for item in attempts.json()]
+    assert outcomes.count("REJECTED_SIGNATURE") == 2
+    assert "ACCEPTED" in outcomes
+
+
+def test_webhook_signing_secret_rotation_invalidates_previous_secret() -> None:
+    suffix = uuid.uuid4().hex
+    project = client.post(
+        "/projects", auth=ADMIN_AUTH, json={"name": f"rotate-webhook-{suffix}"}
+    ).json()
+    endpoint = client.post(
+        f"/projects/{project['id']}/webhook-endpoints",
+        auth=ADMIN_AUTH,
+        json={"name": f"rotate-{suffix}", "source": "generic", "verify_signature": True},
+    ).json()
+    old_secret = endpoint["signing_secret"]
+
+    rotated_response = client.post(
+        f"/webhook-endpoints/{endpoint['id']}/rotate-signing-secret",
+        auth=ADMIN_AUTH,
+    )
+    assert rotated_response.status_code == 200
+    rotated = rotated_response.json()
+    assert rotated["signing_secret_version"] == endpoint["signing_secret_version"] + 1
+    assert rotated["signing_secret"] != old_secret
+
+    payload = b'{"rotate":true}'
+    timestamp = str(int(time.time()))
+    base_headers = {
+        "X-EventForge-Endpoint-Token": endpoint["endpoint_token"],
+        "X-EventForge-Timestamp": timestamp,
+        "X-EventForge-Event-Type": "security.rotated",
+        "Content-Type": "application/json",
+    }
+    old_sig = hmac.new(
+        old_secret.encode(), timestamp.encode() + b"." + payload, hashlib.sha256
+    ).hexdigest()
+    old_headers = dict(base_headers)
+    old_headers["X-EventForge-Delivery-ID"] = f"old-{suffix}"
+    old_headers["X-EventForge-Signature"] = f"sha256={old_sig}"
+    assert client.post("/ingest", headers=old_headers, content=payload).status_code == 401
+
+    new_secret = rotated["signing_secret"].encode()
+    new_sig = hmac.new(
+        new_secret, timestamp.encode() + b"." + payload, hashlib.sha256
+    ).hexdigest()
+    new_headers = dict(base_headers)
+    new_headers["X-EventForge-Delivery-ID"] = f"new-{suffix}"
+    new_headers["X-EventForge-Signature"] = f"sha256={new_sig}"
+    assert client.post("/ingest", headers=new_headers, content=payload).status_code == 202
+
+
+def test_ssrf_validation_blocks_local_metadata_insecure_and_nonstandard_ports() -> None:
+    blocked = [
+        "http://example.com/",
+        "https://127.0.0.1/",
+        "https://169.254.169.254/latest/meta-data/",
+        "https://[::1]/",
+        "https://localhost/",
+        "https://metadata.google.internal/computeMetadata/v1/",
+        "https://8.8.8.8:8443/",
+    ]
+    for url in blocked:
+        with pytest.raises(WorkflowActionError):
+            validate_http_target(url)
+
+
+def test_production_security_rejects_development_secrets() -> None:
+    with pytest.raises(RuntimeError):
+        validate_runtime_security(
+            "production",
+            DEV_ADMIN_PASSWORD,
+            "a" * 40,
+        )
+    with pytest.raises(RuntimeError):
+        validate_runtime_security(
+            "production",
+            "a-strong-production-admin-password",
+            DEV_WEBHOOK_MASTER_SECRET,
+        )
+    validate_runtime_security(
+        "production",
+        "a-strong-production-admin-password",
+        "a-production-webhook-master-secret-that-is-long-enough",
+    )
+
+
+def test_security_headers_are_present() -> None:
+    response = client.get("/")
+    assert response.status_code == 200
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-frame-options"] == "DENY"
+    assert response.headers["referrer-policy"] == "no-referrer"

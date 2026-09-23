@@ -1,6 +1,6 @@
-# EventForge v0.5.0 — Integrated Core
+# EventForge v0.6.0 — Security-Hardened Core
 
-EventForge v1.0 remains intentionally limited to three user-facing products:
+EventForge v1.0 remains limited to the same three user-facing products:
 
 ```text
 HookLedger  -> receive and persist events
@@ -8,134 +8,162 @@ ReplayDB    -> replay immutable historical events
 FlowTrace   -> execute durable structured workflows
 ```
 
-v0.5.0 does **not** add a fourth product. It hardens the links between those
-three products and the development/test process around them.
+v0.6.0 adds security and authorization boundaries around that integrated core.
+It does **not** add another product.
 
-## Integrated event path
+## Control-plane authentication
 
-```text
-Webhook
-  |
-  v
-HookLedger event
-  |
-  v
-PROCESS_EVENT job
-  |
-  v
-FlowTrace workflow version
-  |
-  v
-workflow_run / step_runs
-  |
-  +---- emit_event ----> new immutable EventForge event
-  |
-  v
-ReplayDB replay request
-  |
-  v
-frozen workflow-version selection
-  |
-  v
-replay workflow_run
-```
-
-New webhook events already flow through the normal `PROCESS_EVENT` worker path.
-v0.5 adds explicit integration tests for this path instead of testing each
-module only in isolation.
-
-## Deterministic replay selection
-
-A replay now snapshots the exact FlowTrace workflow versions it means to run
-**when the replay request is created**.
+The development administrator Basic credential remains as the bootstrap/admin
+identity. v0.6 adds project-scoped API keys for normal automation access.
 
 ```text
-original
-  -> versions that processed the historical event
-
-current
-  -> active matching versions at replay-request time
+POST /projects/{project_id}/api-keys
+GET  /projects/{project_id}/api-keys
+POST /project-api-keys/{api_key_id}/revoke
 ```
 
-Those selections are stored in:
+API keys use the `efk_...` format. The plaintext key is returned once; only its
+SHA-256 hash and a short prefix are stored. A project API key can access only
+objects that resolve to its own `project_id`. Cross-project object requests
+return 404 so object existence is not disclosed.
+
+The global administrator remains required to create projects, create/list API
+keys, and revoke API keys.
+
+## Signed HookLedger ingestion
+
+Webhook endpoints can now require HMAC verification:
+
+```json
+{
+  "name": "github-main",
+  "source": "github",
+  "verify_signature": true,
+  "signature_tolerance_seconds": 300
+}
+```
+
+EventForge derives the endpoint signing secret from a server-side master
+secret plus the endpoint id/version. No plaintext endpoint signing secret is
+stored in PostgreSQL.
+
+Preferred EventForge signature format:
 
 ```text
-replay_workflow_selections
+X-EventForge-Timestamp: <unix-seconds>
+X-EventForge-Signature: sha256=<hex-hmac>
 ```
 
-This closes a race from v0.4 where a workflow could be activated after a replay
-was requested but before its worker job was claimed, silently changing the
-meaning of `current`.
-
-Pre-v0.5 replay rows remain readable. If an older replay has no selection
-snapshot, the scheduler retains the previous v0.4 resolution behavior.
-
-## Cross-product event view
-
-v0.5 adds:
+The signed bytes are:
 
 ```text
-GET /events/{event_id}/integration
+<timestamp>.<raw-request-body>
 ```
 
-The response connects one event to its jobs, FlowTrace runs, ReplayDB replays,
-and FlowTrace-emitted child events.
+GitHub's `X-Hub-Signature-256` is also accepted for endpoints whose source is
+`github`. GitHub's signature format does not include a timestamp; EventForge's
+existing delivery-id idempotency still prevents duplicate logical events, but
+it is not a freshness proof.
 
-Replay snapshots can be inspected through:
+New production-mode endpoints always require signatures. Development mode keeps
+signature verification opt-in so existing local fixtures remain compatible.
+
+Signing secrets can be rotated:
 
 ```text
-GET /replays/{replay_id}/workflow-selections
+POST /webhook-endpoints/{endpoint_id}/rotate-signing-secret
 ```
 
-## Isolated integration tests
+## Secret-bearing ingress path
 
-The live development worker must not mutate the same queue rows that pytest is
-asserting against. v0.5 therefore adds a dedicated Compose test service using a
-separate PostgreSQL database:
+The preferred ingestion interface is now:
 
 ```text
-eventforge        -> normal development database
-eventforge_test   -> disposable pytest database
+POST /ingest
+X-EventForge-Endpoint-Token: <endpoint-token>
 ```
 
-Run the complete suite with:
+The old `/ingest/{endpoint_token}` route remains during the v0.x compatibility
+window. Uvicorn access logging is disabled so the legacy secret-bearing URL is
+not written to normal access logs.
+
+## FlowTrace outbound-request boundary
+
+`http_request` actions now use a stricter outbound policy:
+
+```text
+HTTPS required by default
+port 443 allowed by default
+userinfo rejected
+URL fragments rejected
+localhost blocked
+private / loopback / link-local / multicast / reserved IPs blocked
+cloud metadata hostnames blocked
+all DNS answers validated
+connection pinned to a validated resolved IP
+redirects never followed
+response bytes capped
+request timeout capped
+Idempotency-Key = step_run_id
+```
+
+The validated IP is used for the actual TCP connection while TLS SNI and the
+HTTP Host value remain the original hostname. This removes the previous gap
+where validation and the outbound connection could resolve the hostname
+independently.
+
+## Production configuration gate
+
+Set:
+
+```text
+EVENTFORGE_ENV=production
+```
+
+Production startup rejects the known development administrator password and the
+known development webhook master secret. The production administrator password
+must be at least 16 characters and the webhook master secret at least 32.
+
+New production webhook endpoints require signatures regardless of the optional
+development override.
+
+## Security audit visibility
+
+Rejected signed-webhook requests are recorded as:
+
+```text
+REJECTED_SIGNATURE
+```
+
+without storing the supplied signature. Endpoint attempts can be inspected with:
+
+```text
+GET /webhook-endpoints/{endpoint_id}/ingress-attempts
+```
+
+## API identity
+
+```json
+{"name":"EventForge","version":"0.6.0","status":"security-hardened"}
+```
+
+## Local test command
+
+The isolated PostgreSQL test runner introduced in v0.5 remains canonical:
 
 ```bat
 docker compose run --rm test
 ```
 
-The test runner:
-
-1. recreates `eventforge_test`,
-2. applies every migration in order,
-3. sets `DATABASE_URL` only for the pytest subprocess,
-4. runs the suite,
-5. leaves the live `eventforge` database and worker untouched.
-
-This is now the canonical Python test command for v0.5 and later local work.
-
-## API identity
-
-```json
-{"name":"EventForge","version":"0.5.0","status":"integrated-core"}
-```
-
-## Main v0.5 additions
-
-```text
-database/migrations/0006_integration.sql
-apps/api/tests/run_isolated.py
-GET /events/{event_id}/integration
-GET /replays/{replay_id}/workflow-selections
-replay workflow-version snapshots
-cross-product integration tests
-```
+v0.6 adds security tests for project isolation, API-key revocation, HMAC
+freshness, signing-secret rotation, SSRF targets, production configuration, and
+security response headers.
 
 ## Milestone boundary
 
-v0.5 is an integration milestone. Authentication remains the development Basic
-Auth model, HTTP-action destination controls are still pre-v1 hardening work,
-and the frontend is not yet the unified v1 experience.
+v0.6 is not a complete identity platform. There are no user accounts, OAuth,
+SSO, organization roles, or fine-grained RBAC yet. The administrator Basic
+credential remains a bootstrap mechanism for the local-first pre-v1 system.
 
-The next milestone should continue hardening these same three products rather
-than add another product module.
+The next milestone is the unified frontend for HookLedger + ReplayDB +
+FlowTrace, not a fourth product.
