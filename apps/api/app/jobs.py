@@ -192,7 +192,8 @@ def claim_job(
                     updated_at = now()
                 FROM candidate
                 WHERE j.id = candidate.id
-                RETURNING j.id, j.project_id, j.event_id, j.replay_execution_id, j.kind, j.status,
+                RETURNING j.id, j.project_id, j.event_id, j.replay_execution_id,
+                          j.workflow_run_id, j.step_run_id, j.kind, j.status,
                           j.attempt_count, j.max_attempts, j.available_at,
                           j.lease_owner, j.lease_token, j.lease_expires_at,
                           j.created_at, j.updated_at

@@ -1,9 +1,12 @@
+import json
+import time
 import uuid
 
 from fastapi.testclient import TestClient
 
 from app.db import db_connect
 from app.jobs import (
+    LostLeaseError,
     claim_job,
     complete_job,
     fail_job,
@@ -13,6 +16,7 @@ from app.jobs import (
 )
 from app.main import ADMIN_PASSWORD, ADMIN_USER, app
 from app.worker import process_replay_job
+from app.workflows import process_workflow_step_job, schedule_workflows_for_event
 
 client = TestClient(app)
 ADMIN_AUTH = (ADMIN_USER, ADMIN_PASSWORD)
@@ -119,8 +123,8 @@ def test_health() -> None:
 def test_root_version() -> None:
     response = client.get("/")
     assert response.status_code == 200
-    assert response.json()["version"] == "0.3.0"
-    assert response.json()["status"] == "replaydb"
+    assert response.json()["version"] == "0.4.0"
+    assert response.json()["status"] == "flowtrace"
 
 
 def test_control_plane_requires_authentication() -> None:
@@ -479,3 +483,281 @@ def test_replay_processor_reads_original_postgres_payload_without_copying_it() -
     assert payload_count["count"] == 1
     assert event_snapshot(event_id) == before
     assert project_event_count(project_id) == 1
+
+
+def create_workflow_api(
+    project_id: str,
+    *,
+    name: str | None = None,
+    steps: list[dict] | None = None,
+) -> dict:
+    if name is None:
+        name = f"flow-{uuid.uuid4().hex}"
+    if steps is None:
+        steps = [{"type": "json_transform", "set": {"flowtrace": "ok"}}]
+    response = client.post(
+        f"/projects/{project_id}/workflows",
+        auth=ADMIN_AUTH,
+        json={
+            "name": name,
+            "trigger": {"source": "generic", "type": "test.created"},
+            "steps": steps,
+        },
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def get_run_row(run_id: str | uuid.UUID) -> dict:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM workflow_runs WHERE id = %s", (run_id,))
+            row = cur.fetchone()
+    assert row is not None
+    return row
+
+
+def get_step_rows(run_id: str | uuid.UUID) -> list[dict]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM step_runs WHERE workflow_run_id = %s ORDER BY step_index",
+                (run_id,),
+            )
+            return list(cur.fetchall())
+
+
+def drive_workflow_until_terminal(run_id: uuid.UUID, *, timeout_seconds: float = 5.0) -> dict:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        run = get_run_row(run_id)
+        if run["status"] in {"SUCCESS", "FAILED"}:
+            return run
+
+        claimed = claim_job("pytest-flowtrace", kinds=("RUN_WORKFLOW_STEP",))
+        if claimed is None:
+            time.sleep(0.05)
+            continue
+        try:
+            process_workflow_step_job(claimed)
+            complete_job(claimed["id"], claimed["lease_token"])
+        except LostLeaseError:
+            # A real background worker can win the same race on local Compose.
+            pass
+
+    raise AssertionError(f"workflow run {run_id} did not finish before timeout")
+
+
+def test_flowtrace_create_workflow_persists_version_one() -> None:
+    project_id, _ = create_event()
+    workflow = create_workflow_api(project_id)
+
+    assert workflow["project_id"] == project_id
+    assert workflow["active_version"]["version_number"] == 1
+    assert workflow["active_version"]["trigger_source"] == "generic"
+    assert workflow["active_version"]["trigger_type"] == "test.created"
+
+    versions = client.get(f"/workflows/{workflow['id']}/versions", auth=ADMIN_AUTH)
+    assert versions.status_code == 200
+    assert len(versions.json()) == 1
+    assert versions.json()[0]["active"] is True
+
+
+def test_flowtrace_condition_transform_emit_event_pipeline() -> None:
+    project_id, event_id = create_event()
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT body FROM event_payloads WHERE event_id = %s", (event_id,))
+            body = cur.fetchone()
+    assert body is not None
+    suffix = json.loads(bytes(body["body"]))["value"]
+
+    create_workflow_api(
+        project_id,
+        steps=[
+            {"type": "conditional", "path": "value", "equals": suffix},
+            {"type": "json_transform", "set": {"result.status": "transformed"}},
+            {"type": "emit_event", "source": "flowtrace", "event_type": "flow.completed"},
+        ],
+    )
+
+    run_ids = schedule_workflows_for_event(uuid.UUID(project_id), uuid.UUID(event_id))
+    assert len(run_ids) == 1
+    run = drive_workflow_until_terminal(run_ids[0])
+    assert run["status"] == "SUCCESS"
+    assert run["context"]["result"]["status"] == "transformed"
+
+    steps = get_step_rows(run_ids[0])
+    assert [step["status"] for step in steps] == ["SUCCESS", "SUCCESS", "SUCCESS"]
+    emitted_step = steps[-1]
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, source, type, parent_event_id FROM events WHERE emitted_by_step_run_id = %s",
+                (emitted_step["id"],),
+            )
+            emitted = cur.fetchone()
+    assert emitted is not None
+    assert emitted["source"] == "flowtrace"
+    assert emitted["type"] == "flow.completed"
+    assert str(emitted["parent_event_id"]) == event_id
+
+
+def test_flowtrace_false_condition_skips_remaining_steps() -> None:
+    project_id, event_id = create_event()
+    create_workflow_api(
+        project_id,
+        steps=[
+            {"type": "conditional", "path": "value", "equals": "definitely-not-the-payload"},
+            {"type": "json_transform", "set": {"should_not": "run"}},
+            {"type": "emit_event", "event_type": "should.not.emit"},
+        ],
+    )
+
+    run_ids = schedule_workflows_for_event(uuid.UUID(project_id), uuid.UUID(event_id))
+    assert len(run_ids) == 1
+    run = drive_workflow_until_terminal(run_ids[0])
+    assert run["status"] == "SUCCESS"
+    steps = get_step_rows(run_ids[0])
+    assert [step["status"] for step in steps] == ["SUCCESS", "SKIPPED", "SKIPPED"]
+
+
+def test_flowtrace_current_events_use_active_workflow_version() -> None:
+    project_id, event_id = create_event()
+    workflow = create_workflow_api(project_id)
+    second = client.post(
+        f"/workflows/{workflow['id']}/versions",
+        auth=ADMIN_AUTH,
+        json={
+            "trigger": {"source": "generic", "type": "test.created"},
+            "steps": [{"type": "json_transform", "set": {"version": 2}}],
+            "activate": True,
+        },
+    )
+    assert second.status_code == 201
+    assert second.json()["version_number"] == 2
+
+    run_ids = schedule_workflows_for_event(uuid.UUID(project_id), uuid.UUID(event_id))
+    assert len(run_ids) == 1
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT v.version_number
+                FROM workflow_runs AS wr
+                JOIN workflow_versions AS v ON v.id = wr.workflow_version_id
+                WHERE wr.id = %s
+                """,
+                (run_ids[0],),
+            )
+            row = cur.fetchone()
+    assert row is not None
+    assert row["version_number"] == 2
+
+
+def test_replay_original_and_current_resolve_real_workflow_versions() -> None:
+    project_id, event_id = create_event()
+    workflow = create_workflow_api(project_id)
+
+    original_runs = schedule_workflows_for_event(uuid.UUID(project_id), uuid.UUID(event_id))
+    assert len(original_runs) == 1
+
+    second = client.post(
+        f"/workflows/{workflow['id']}/versions",
+        auth=ADMIN_AUTH,
+        json={
+            "trigger": {"source": "generic", "type": "test.created"},
+            "steps": [{"type": "json_transform", "set": {"version": 2}}],
+            "activate": True,
+        },
+    )
+    assert second.status_code == 201
+
+    original_replay = client.post(
+        f"/events/{event_id}/replays",
+        auth=ADMIN_AUTH,
+        json={"workflow_version_mode": "original"},
+    ).json()
+    current_replay = client.post(
+        f"/events/{event_id}/replays",
+        auth=ADMIN_AUTH,
+        json={"workflow_version_mode": "current"},
+    ).json()
+
+    schedule_workflows_for_event(
+        uuid.UUID(project_id),
+        uuid.UUID(event_id),
+        replay_execution_id=uuid.UUID(original_replay["id"]),
+        mode="original",
+    )
+    schedule_workflows_for_event(
+        uuid.UUID(project_id),
+        uuid.UUID(event_id),
+        replay_execution_id=uuid.UUID(current_replay["id"]),
+        mode="current",
+    )
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT wr.replay_execution_id, v.version_number
+                FROM workflow_runs AS wr
+                JOIN workflow_versions AS v ON v.id = wr.workflow_version_id
+                WHERE wr.replay_execution_id = ANY(%s)
+                ORDER BY wr.replay_execution_id
+                """,
+                ([uuid.UUID(original_replay["id"]), uuid.UUID(current_replay["id"])],),
+            )
+            rows = list(cur.fetchall())
+    versions = {str(row["replay_execution_id"]): row["version_number"] for row in rows}
+    assert versions[original_replay["id"]] == 1
+    assert versions[current_replay["id"]] == 2
+
+
+def test_flowtrace_expired_step_lease_resumes_after_previous_step_commit() -> None:
+    project_id, event_id = create_event()
+    create_workflow_api(
+        project_id,
+        steps=[
+            {"type": "json_transform", "set": {"phase": "one"}},
+            {"type": "json_transform", "set": {"phase": "two"}},
+        ],
+    )
+    test_kind = f"TEST_FLOW_STEP_{uuid.uuid4().hex}"
+    run_ids = schedule_workflows_for_event(
+        uuid.UUID(project_id),
+        uuid.UUID(event_id),
+        first_job_kind=test_kind,
+    )
+    assert len(run_ids) == 1
+
+    first = claim_job("flowtrace-first", kinds=(test_kind,))
+    assert first is not None
+    process_workflow_step_job(first)
+    complete_job(first["id"], first["lease_token"])
+    assert get_step_rows(run_ids[0])[0]["status"] == "SUCCESS"
+
+    second = claim_job("flowtrace-crashed", kinds=(test_kind,), lease_seconds=30)
+    assert second is not None
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE jobs SET lease_expires_at = now() - interval '1 second' WHERE id = %s",
+                (second["id"],),
+            )
+
+    recovery = recover_expired_leases()
+    assert recovery["requeued"] >= 1
+    promote_due_retries()
+
+    resumed = claim_job("flowtrace-resumed", kinds=(test_kind,))
+    assert resumed is not None
+    process_workflow_step_job(resumed)
+    complete_job(resumed["id"], resumed["lease_token"])
+
+    run = get_run_row(run_ids[0])
+    assert run["status"] == "SUCCESS"
+    assert run["context"]["phase"] == "two"
+    assert [step["status"] for step in get_step_rows(run_ids[0])] == ["SUCCESS", "SUCCESS"]
+    assert attempt_outcomes(str(second["id"])) == ["LEASE_EXPIRED", "SUCCESS"]

@@ -2,7 +2,7 @@ import hashlib
 import os
 import secrets
 import uuid
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Union
 
 import psycopg
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -11,9 +11,10 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 
 from app.db import db_connect
+from app.workflows import schedule_workflows_for_event
 
 ADMIN_USER = os.getenv("EVENTFORGE_ADMIN_USER", "eventforge")
 ADMIN_PASSWORD = os.getenv("EVENTFORGE_ADMIN_PASSWORD", "eventforge_dev_only_admin")
@@ -22,7 +23,7 @@ MAX_INGEST_BYTES = int(os.getenv("EVENTFORGE_MAX_INGEST_BYTES", "1048576"))
 app = FastAPI(
     title="EventForge Control API",
     version=APP_VERSION,
-    description="v0.3 ReplayDB immutable event replay",
+    description="v0.4 FlowTrace durable automation workflows",
 )
 
 app.add_middleware(
@@ -47,6 +48,58 @@ class EndpointCreate(BaseModel):
 
 class ReplayCreate(BaseModel):
     workflow_version_mode: Literal["original", "current"] = "original"
+
+
+class WorkflowTrigger(BaseModel):
+    source: str = Field(min_length=1, max_length=80)
+    type: str = Field(min_length=1, max_length=120)
+
+
+class ConditionalStep(BaseModel):
+    type: Literal["conditional"]
+    path: str = Field(min_length=1, max_length=200)
+    equals: Any
+
+
+class DelayStep(BaseModel):
+    type: Literal["delay"]
+    seconds: float = Field(ge=0, le=3600)
+
+
+class JsonTransformStep(BaseModel):
+    type: Literal["json_transform"]
+    set: dict[str, Any] = Field(min_length=1)
+
+
+class EmitEventStep(BaseModel):
+    type: Literal["emit_event"]
+    event_type: str = Field(min_length=1, max_length=120)
+    source: str = Field(default="flowtrace", min_length=1, max_length=80)
+
+
+class HttpRequestStep(BaseModel):
+    type: Literal["http_request"]
+    method: Literal["GET", "POST"] = "POST"
+    url: str = Field(min_length=8, max_length=2048)
+    timeout_seconds: float = Field(default=5.0, gt=0, le=10)
+
+
+WorkflowStep = Annotated[
+    Union[ConditionalStep, DelayStep, JsonTransformStep, EmitEventStep, HttpRequestStep],
+    Field(discriminator="type"),
+]
+
+
+class WorkflowCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    trigger: WorkflowTrigger
+    steps: list[WorkflowStep] = Field(min_length=1, max_length=50)
+
+
+class WorkflowVersionCreate(BaseModel):
+    trigger: WorkflowTrigger
+    steps: list[WorkflowStep] = Field(min_length=1, max_length=50)
+    activate: bool = True
 
 
 
@@ -92,7 +145,7 @@ def root() -> dict[str, str]:
     return {
         "name": "EventForge",
         "version": APP_VERSION,
-        "status": "replaydb",
+        "status": "flowtrace",
     }
 
 
@@ -309,7 +362,7 @@ def list_jobs(
             if job_status is None:
                 cur.execute(
                     """
-                    SELECT id, project_id, event_id, replay_execution_id, kind, status,
+                    SELECT id, project_id, event_id, replay_execution_id, workflow_run_id, step_run_id, kind, status,
                            attempt_count, max_attempts, available_at,
                            lease_owner, lease_expires_at, last_error,
                            created_at, updated_at, completed_at
@@ -323,7 +376,7 @@ def list_jobs(
             else:
                 cur.execute(
                     """
-                    SELECT id, project_id, event_id, replay_execution_id, kind, status,
+                    SELECT id, project_id, event_id, replay_execution_id, workflow_run_id, step_run_id, kind, status,
                            attempt_count, max_attempts, available_at,
                            lease_owner, lease_expires_at, last_error,
                            created_at, updated_at, completed_at
@@ -346,7 +399,7 @@ def get_job(
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, project_id, event_id, replay_execution_id, kind, status,
+                SELECT id, project_id, event_id, replay_execution_id, workflow_run_id, step_run_id, kind, status,
                        attempt_count, max_attempts, available_at,
                        lease_owner, lease_token, lease_expires_at,
                        last_error, created_at, updated_at, completed_at
@@ -528,6 +581,334 @@ def get_replay(
     if replay is None:
         raise HTTPException(status_code=404, detail="replay not found")
     return replay
+
+
+def _workflow_definition(trigger: WorkflowTrigger, steps: list[WorkflowStep]) -> dict[str, Any]:
+    return {
+        "trigger": trigger.model_dump(),
+        "steps": [step.model_dump() for step in steps],
+    }
+
+
+@app.post("/projects/{project_id}/workflows", status_code=status.HTTP_201_CREATED)
+def create_workflow(
+    project_id: uuid.UUID,
+    payload: WorkflowCreate,
+    _: Annotated[None, Depends(require_admin)],
+) -> dict[str, Any]:
+    workflow_id = uuid.uuid4()
+    version_id = uuid.uuid4()
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="workflow name cannot be blank")
+    trigger_source = payload.trigger.source.strip().lower()
+    trigger_type = payload.trigger.type.strip()
+    if not trigger_source or not trigger_type:
+        raise HTTPException(status_code=422, detail="workflow trigger cannot be blank")
+    definition = _workflow_definition(
+        WorkflowTrigger(source=trigger_source, type=trigger_type), payload.steps
+    )
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM projects WHERE id = %s", (project_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=404, detail="project not found")
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO workflows(id, project_id, name)
+                    VALUES (%s, %s, %s)
+                    RETURNING id, project_id, name, enabled, created_at, updated_at
+                    """,
+                    (workflow_id, project_id, name),
+                )
+                workflow = cur.fetchone()
+                cur.execute(
+                    """
+                    INSERT INTO workflow_versions(
+                        id, project_id, workflow_id, version_number,
+                        trigger_source, trigger_type, definition
+                    )
+                    VALUES (%s, %s, %s, 1, %s, %s, %s)
+                    RETURNING id, version_number, trigger_source, trigger_type,
+                              definition, created_at
+                    """,
+                    (
+                        version_id,
+                        project_id,
+                        workflow_id,
+                        trigger_source,
+                        trigger_type,
+                        Jsonb(definition),
+                    ),
+                )
+                version = cur.fetchone()
+                cur.execute(
+                    """
+                    UPDATE workflows
+                    SET active_version_id = %s, updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (version_id, workflow_id),
+                )
+            except psycopg.errors.UniqueViolation as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="a workflow with this name already exists in the project",
+                ) from exc
+
+    assert workflow is not None and version is not None
+    return {**workflow, "active_version_id": version_id, "active_version": version}
+
+
+@app.post("/workflows/{workflow_id}/versions", status_code=status.HTTP_201_CREATED)
+def create_workflow_version(
+    workflow_id: uuid.UUID,
+    payload: WorkflowVersionCreate,
+    _: Annotated[None, Depends(require_admin)],
+) -> dict[str, Any]:
+    version_id = uuid.uuid4()
+    trigger_source = payload.trigger.source.strip().lower()
+    trigger_type = payload.trigger.type.strip()
+    definition = _workflow_definition(
+        WorkflowTrigger(source=trigger_source, type=trigger_type), payload.steps
+    )
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, project_id FROM workflows WHERE id = %s FOR UPDATE",
+                (workflow_id,),
+            )
+            workflow = cur.fetchone()
+            if workflow is None:
+                raise HTTPException(status_code=404, detail="workflow not found")
+            cur.execute(
+                "SELECT COALESCE(MAX(version_number), 0) + 1 AS next_version FROM workflow_versions WHERE workflow_id = %s",
+                (workflow_id,),
+            )
+            next_version = cur.fetchone()
+            assert next_version is not None
+            cur.execute(
+                """
+                INSERT INTO workflow_versions(
+                    id, project_id, workflow_id, version_number,
+                    trigger_source, trigger_type, definition
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id, project_id, workflow_id, version_number,
+                          trigger_source, trigger_type, definition, created_at
+                """,
+                (
+                    version_id,
+                    workflow["project_id"],
+                    workflow_id,
+                    next_version["next_version"],
+                    trigger_source,
+                    trigger_type,
+                    Jsonb(definition),
+                ),
+            )
+            version = cur.fetchone()
+            if payload.activate:
+                cur.execute(
+                    "UPDATE workflows SET active_version_id = %s, updated_at = now() WHERE id = %s",
+                    (version_id, workflow_id),
+                )
+
+    assert version is not None
+    version["active"] = payload.activate
+    return version
+
+
+@app.post("/workflows/{workflow_id}/versions/{version_number}/activate")
+def activate_workflow_version(
+    workflow_id: uuid.UUID,
+    version_number: int,
+    _: Annotated[None, Depends(require_admin)],
+) -> dict[str, Any]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, project_id, workflow_id, version_number
+                FROM workflow_versions
+                WHERE workflow_id = %s AND version_number = %s
+                """,
+                (workflow_id, version_number),
+            )
+            version = cur.fetchone()
+            if version is None:
+                raise HTTPException(status_code=404, detail="workflow version not found")
+            cur.execute(
+                """
+                UPDATE workflows
+                SET active_version_id = %s, updated_at = now()
+                WHERE id = %s
+                RETURNING id, project_id, name, enabled, active_version_id, created_at, updated_at
+                """,
+                (version["id"], workflow_id),
+            )
+            workflow = cur.fetchone()
+    if workflow is None:
+        raise HTTPException(status_code=404, detail="workflow not found")
+    return workflow
+
+
+@app.get("/projects/{project_id}/workflows")
+def list_workflows(
+    project_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+) -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT w.id, w.project_id, w.name, w.enabled, w.active_version_id,
+                       v.version_number AS active_version_number,
+                       v.trigger_source, v.trigger_type,
+                       w.created_at, w.updated_at
+                FROM workflows AS w
+                LEFT JOIN workflow_versions AS v ON v.id = w.active_version_id
+                WHERE w.project_id = %s
+                ORDER BY w.created_at DESC
+                """,
+                (project_id,),
+            )
+            return list(cur.fetchall())
+
+
+@app.get("/workflows/{workflow_id}")
+def get_workflow(
+    workflow_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+) -> dict[str, Any]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT w.id, w.project_id, w.name, w.enabled, w.active_version_id,
+                       v.version_number AS active_version_number,
+                       v.trigger_source, v.trigger_type, v.definition,
+                       w.created_at, w.updated_at
+                FROM workflows AS w
+                LEFT JOIN workflow_versions AS v ON v.id = w.active_version_id
+                WHERE w.id = %s
+                """,
+                (workflow_id,),
+            )
+            workflow = cur.fetchone()
+    if workflow is None:
+        raise HTTPException(status_code=404, detail="workflow not found")
+    return workflow
+
+
+@app.get("/workflows/{workflow_id}/versions")
+def list_workflow_versions(
+    workflow_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+) -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT v.id, v.project_id, v.workflow_id, v.version_number,
+                       v.trigger_source, v.trigger_type, v.definition, v.created_at,
+                       (w.active_version_id = v.id) AS active
+                FROM workflow_versions AS v
+                JOIN workflows AS w ON w.id = v.workflow_id
+                WHERE v.workflow_id = %s
+                ORDER BY v.version_number
+                """,
+                (workflow_id,),
+            )
+            return list(cur.fetchall())
+
+
+@app.get("/projects/{project_id}/workflow-runs")
+def list_workflow_runs(
+    project_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    limit = max(1, min(limit, 200))
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT wr.id, wr.project_id, wr.workflow_id, wr.workflow_version_id,
+                       v.version_number, wr.event_id, wr.replay_execution_id,
+                       wr.status, wr.error, wr.created_at, wr.started_at, wr.completed_at
+                FROM workflow_runs AS wr
+                JOIN workflow_versions AS v ON v.id = wr.workflow_version_id
+                WHERE wr.project_id = %s
+                ORDER BY wr.created_at DESC
+                LIMIT %s
+                """,
+                (project_id, limit),
+            )
+            return list(cur.fetchall())
+
+
+@app.get("/workflow-runs/{run_id}")
+def get_workflow_run(
+    run_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+) -> dict[str, Any]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT wr.id, wr.project_id, wr.workflow_id, wr.workflow_version_id,
+                       v.version_number, wr.event_id, wr.replay_execution_id,
+                       wr.status, wr.context, wr.error,
+                       wr.created_at, wr.started_at, wr.completed_at
+                FROM workflow_runs AS wr
+                JOIN workflow_versions AS v ON v.id = wr.workflow_version_id
+                WHERE wr.id = %s
+                """,
+                (run_id,),
+            )
+            run = cur.fetchone()
+    if run is None:
+        raise HTTPException(status_code=404, detail="workflow run not found")
+    return run
+
+
+@app.get("/workflow-runs/{run_id}/steps")
+def list_workflow_steps(
+    run_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+) -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, project_id, workflow_run_id, step_index, step_type,
+                       config, status, output, error, started_at, completed_at
+                FROM step_runs
+                WHERE workflow_run_id = %s
+                ORDER BY step_index
+                """,
+                (run_id,),
+            )
+            return list(cur.fetchall())
+
+
+@app.post("/events/{event_id}/workflow-runs", status_code=status.HTTP_202_ACCEPTED)
+def schedule_event_workflows(
+    event_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+) -> dict[str, Any]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, project_id FROM events WHERE id = %s", (event_id,))
+            event = cur.fetchone()
+    if event is None:
+        raise HTTPException(status_code=404, detail="event not found")
+    run_ids = schedule_workflows_for_event(event["project_id"], event_id, mode="current")
+    return {"event_id": event_id, "scheduled_run_ids": run_ids}
 
 
 @app.post("/ingest/{endpoint_token}", status_code=status.HTTP_202_ACCEPTED)

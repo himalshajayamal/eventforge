@@ -5,7 +5,6 @@ import os
 import signal
 import socket
 import threading
-import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -18,6 +17,11 @@ from app.jobs import (
     fail_job,
     promote_due_retries,
     recover_expired_leases,
+)
+from app.workflows import (
+    process_workflow_step_job,
+    record_workflow_job_failure,
+    schedule_workflows_for_event,
 )
 
 POLL_SECONDS = float(os.getenv("EVENTFORGE_WORKER_POLL_SECONDS", "0.5"))
@@ -46,11 +50,7 @@ def log_record(level: str, operation: str, result: str, **fields: Any) -> None:
 
 
 def process_event_job(job: dict[str, Any]) -> None:
-    """v0.2 processor: validate that the durable event/payload exists.
-
-    Actual workflow actions arrive in later milestones. v0.2 focuses on reliable
-    queue ownership, leases, retries and attempt history.
-    """
+    """Validate the durable event/payload and schedule matching FlowTrace runs."""
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -65,14 +65,15 @@ def process_event_job(job: dict[str, Any]) -> None:
             if cur.fetchone() is None:
                 raise RuntimeError("event payload is missing")
 
+    schedule_workflows_for_event(
+        job["project_id"],
+        job["event_id"],
+        mode="current",
+    )
+
 
 def process_replay_job(job: dict[str, Any]) -> None:
-    """Validate that a replay execution can read the immutable source payload.
-
-    v0.3 intentionally does not execute workflow steps yet; FlowTrace arrives in
-    v0.4. Completing this job proves that a distinct replay execution can be
-    scheduled from a historical event without rewriting the event or payload.
-    """
+    """Resolve ReplayDB original/current intent to durable FlowTrace runs."""
     replay_execution_id = job.get("replay_execution_id")
     if replay_execution_id is None:
         raise RuntimeError("replay job is missing replay_execution_id")
@@ -91,8 +92,16 @@ def process_replay_job(job: dict[str, Any]) -> None:
                 """,
                 (replay_execution_id, job["project_id"], job["event_id"]),
             )
-            if cur.fetchone() is None:
+            replay = cur.fetchone()
+            if replay is None:
                 raise RuntimeError("replay source event or payload is missing")
+
+    schedule_workflows_for_event(
+        job["project_id"],
+        job["event_id"],
+        replay_execution_id=replay_execution_id,
+        mode=replay["workflow_version_mode"],
+    )
 
 
 def process_job(job: dict[str, Any]) -> None:
@@ -101,6 +110,9 @@ def process_job(job: dict[str, Any]) -> None:
         return
     if job["kind"] == "REPLAY_EVENT":
         process_replay_job(job)
+        return
+    if job["kind"] == "RUN_WORKFLOW_STEP":
+        process_workflow_step_job(job)
         return
     raise RuntimeError(f"unsupported job kind: {job['kind']}")
 
@@ -124,7 +136,11 @@ def run() -> None:
         if promoted:
             log_record("INFO", "promote_due_retries", "promoted", count=promoted)
 
-        job = claim_job(WORKER_ID, lease_seconds=LEASE_SECONDS, kinds=("PROCESS_EVENT", "REPLAY_EVENT"))
+        job = claim_job(
+            WORKER_ID,
+            lease_seconds=LEASE_SECONDS,
+            kinds=("PROCESS_EVENT", "REPLAY_EVENT", "RUN_WORKFLOW_STEP"),
+        )
         if job is None:
             stop_event.wait(POLL_SECONDS)
             continue
@@ -133,10 +149,15 @@ def run() -> None:
             "project_id": job["project_id"],
             "event_id": job["event_id"],
             "job_id": job["id"],
+            "job_kind": job["kind"],
             "attempt": job["attempt_count"],
         }
         if job.get("replay_execution_id") is not None:
             base_fields["replay_execution_id"] = job["replay_execution_id"]
+        if job.get("workflow_run_id") is not None:
+            base_fields["workflow_run_id"] = job["workflow_run_id"]
+        if job.get("step_run_id") is not None:
+            base_fields["step_run_id"] = job["step_run_id"]
         log_record("INFO", "job_claim", "claimed", **base_fields)
 
         try:
@@ -154,6 +175,7 @@ def run() -> None:
                     base_delay_seconds=RETRY_BASE_SECONDS,
                     max_delay_seconds=RETRY_MAX_SECONDS,
                 )
+                record_workflow_job_failure(job, state, str(exc))
                 log_record("ERROR", "job_execute", state.lower(), error=str(exc), **base_fields)
             except LostLeaseError as lease_exc:
                 log_record(
