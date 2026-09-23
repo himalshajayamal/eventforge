@@ -132,13 +132,64 @@ def test_health() -> None:
 def test_root_version() -> None:
     response = client.get("/")
     assert response.status_code == 200
-    assert response.json()["version"] == "0.6.0"
-    assert response.json()["status"] == "security-hardened"
+    assert response.json()["version"] == "0.7.0"
+    assert response.json()["status"] == "unified-dashboard"
 
 
 def test_control_plane_requires_authentication() -> None:
     response = client.post("/projects", json={"name": "unauthorized"})
     assert response.status_code == 401
+
+
+def test_admin_project_listing_is_available_for_dashboard_but_not_project_keys() -> None:
+    suffix = uuid.uuid4().hex
+    project = client.post(
+        "/projects", auth=ADMIN_AUTH, json={"name": f"dashboard-list-{suffix}"}
+    ).json()
+
+    listed = client.get("/projects", auth=ADMIN_AUTH)
+    assert listed.status_code == 200
+    assert any(item["id"] == project["id"] for item in listed.json())
+
+    key = client.post(
+        f"/projects/{project['id']}/api-keys",
+        auth=ADMIN_AUTH,
+        json={"name": "dashboard"},
+    ).json()["api_key"]
+    denied = client.get("/projects", headers={"Authorization": f"Bearer {key}"})
+    assert denied.status_code == 404
+
+
+def test_project_summary_reports_dashboard_counts() -> None:
+    suffix = uuid.uuid4().hex
+    project = client.post(
+        "/projects", auth=ADMIN_AUTH, json={"name": f"dashboard-summary-{suffix}"}
+    ).json()
+    endpoint = client.post(
+        f"/projects/{project['id']}/webhook-endpoints",
+        auth=ADMIN_AUTH,
+        json={"name": f"summary-{suffix}", "source": "generic"},
+    ).json()
+    accepted = client.post(
+        "/ingest",
+        headers={
+            "X-EventForge-Endpoint-Token": endpoint["endpoint_token"],
+            "X-EventForge-Delivery-ID": f"summary-{suffix}",
+            "X-EventForge-Event-Type": "dashboard.created",
+        },
+        json={"dashboard": True},
+    )
+    assert accepted.status_code == 202
+
+    summary = client.get(f"/projects/{project['id']}/summary", auth=ADMIN_AUTH)
+    assert summary.status_code == 200
+    body = summary.json()
+    assert body["project"]["id"] == project["id"]
+    assert body["counts"]["webhook_endpoints"] == 1
+    assert body["counts"]["events"] == 1
+    assert body["counts"]["jobs"] >= 1
+    assert body["counts"]["replays"] == 0
+    assert body["counts"]["workflows"] == 0
 
 
 def test_hookledger_idempotency_and_history() -> None:

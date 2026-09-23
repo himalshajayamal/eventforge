@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 
 from app.db import db_connect
 from app.security import (
@@ -33,7 +33,7 @@ MAX_INGEST_BYTES = int(os.getenv("EVENTFORGE_MAX_INGEST_BYTES", "1048576"))
 app = FastAPI(
     title="EventForge Control API",
     version=APP_VERSION,
-    description="v0.6 security-hardened HookLedger + ReplayDB + FlowTrace core",
+    description="v0.7 unified HookLedger + ReplayDB + FlowTrace operations dashboard",
 )
 
 app.add_middleware(
@@ -137,7 +137,7 @@ def root() -> dict[str, str]:
     return {
         "name": "EventForge",
         "version": APP_VERSION,
-        "status": "security-hardened",
+        "status": "unified-dashboard",
     }
 
 
@@ -185,6 +185,55 @@ def create_project(
 
     assert project is not None
     return project
+
+
+@app.get("/projects")
+def list_projects(
+    _: Annotated[None, Depends(require_admin)],
+) -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, name, created_at
+                FROM projects
+                ORDER BY created_at DESC
+                """
+            )
+            return list(cur.fetchall())
+
+
+@app.get("/projects/{project_id}/summary")
+def get_project_summary(
+    project_id: uuid.UUID,
+    _: Annotated[None, Depends(require_control_access)],
+) -> dict[str, Any]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, name, created_at FROM projects WHERE id = %s",
+                (project_id,),
+            )
+            project = cur.fetchone()
+            if project is None:
+                raise HTTPException(status_code=404, detail="project not found")
+            cur.execute(
+                """
+                SELECT
+                    (SELECT count(*) FROM ingress_endpoints WHERE project_id = %s)::integer AS webhook_endpoints,
+                    (SELECT count(*) FROM events WHERE project_id = %s)::integer AS events,
+                    (SELECT count(*) FROM jobs WHERE project_id = %s)::integer AS jobs,
+                    (SELECT count(*) FROM jobs WHERE project_id = %s AND status IN ('PENDING', 'RUNNING', 'RETRY_WAIT'))::integer AS pending_jobs,
+                    (SELECT count(*) FROM jobs WHERE project_id = %s AND status = 'DEAD_LETTERED')::integer AS dead_lettered_jobs,
+                    (SELECT count(*) FROM replay_executions WHERE project_id = %s)::integer AS replays,
+                    (SELECT count(*) FROM workflows WHERE project_id = %s)::integer AS workflows,
+                    (SELECT count(*) FROM workflow_runs WHERE project_id = %s)::integer AS workflow_runs
+                """,
+                (project_id,) * 8,
+            )
+            counts = cur.fetchone()
+    assert counts is not None
+    return {"project": project, "counts": counts}
 
 
 @app.post("/projects/{project_id}/api-keys", status_code=status.HTTP_201_CREATED)
