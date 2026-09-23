@@ -1,0 +1,3283 @@
+# EventForge
+
+## Engineering Design, Architecture, Development and Deployment Report
+
+**Document status:** Initial engineering baseline
+**Target application version:** `1.0.0`
+**Development model:** Local-first, cloud-deployable, open source
+**Primary engineering languages:** C, C++, Python
+**Secondary UI language:** TypeScript
+**Primary database:** PostgreSQL
+**Date baseline:** 23 September 2026
+
+---
+
+# 1. Executive Summary
+
+EventForge will be a software-only developer infrastructure platform.
+
+Its fundamental job is extremely simple:
+
+```text
+Receive something
+      ↓
+store it safely
+      ↓
+process it
+      ↓
+perform actions
+      ↓
+record exactly what happened
+      ↓
+allow it to be inspected/replayed/tested
+```
+
+The original ten project ideas become modules of this one system:
+
+| Module          | Original project  | Purpose                                    |
+| --------------- | ----------------- | ------------------------------------------ |
+| Webhooks        | HookLedger        | Reliably receive and deliver events        |
+| Replay          | ReplayDB          | Store and replay historical events         |
+| Automation      | FlowTrace         | Execute reliable workflows                 |
+| Gateway         | QuotaGate         | Protect APIs with rate/concurrency limits  |
+| Tracing         | TracePocket       | Explain where requests/events spent time   |
+| Chaos           | FaultMesh         | Intentionally simulate network/API failure |
+| Database Events | ChangeWire        | Convert database changes into events       |
+| API Watch       | DriftLens         | Detect changes in APIs                     |
+| Synchronization | SyncForge         | Synchronize records between systems        |
+| Migration Lab   | MigrationSentinel | Test database migrations under load        |
+
+They are **not ten independent applications**.
+
+They share:
+
+```text
+authentication
+projects
+events
+database
+queue
+workers
+traces
+API keys
+permissions
+HTTP client
+retry engine
+scheduler
+logging
+frontend
+deployment
+```
+
+The architectural strategy therefore is:
+
+> One platform, one shared event core, several independently visible tools.
+
+---
+
+# 2. What Problem Does EventForge Solve?
+
+Modern applications communicate through:
+
+```text
+APIs
+webhooks
+database changes
+background jobs
+scheduled jobs
+queues
+external services
+```
+
+Failures become difficult because an engineer may see:
+
+```text
+GitHub
+  ↓
+webhook
+  ↓
+API
+  ↓
+database
+  ↓
+worker
+  ↓
+another API
+  ↓
+failure
+```
+
+and have no simple answer to:
+
+```text
+What happened?
+
+Did we receive the event?
+
+Did we process it twice?
+
+Why did it fail?
+
+Was it retried?
+
+What API was called?
+
+How long did each step take?
+
+Can I replay it?
+
+What if the destination becomes slow?
+
+What if my database changes?
+
+What if somebody floods my API?
+```
+
+EventForge exists to answer those questions in one place.
+
+---
+
+# 3. The Central Engineering Abstraction
+
+Everything entering the platform becomes an **Event**.
+
+Example:
+
+```json
+{
+  "id": "0199...",
+  "project_id": "0198...",
+  "source": "github",
+  "type": "push",
+  "occurred_at": "2026-09-23T12:30:00Z",
+  "received_at": "2026-09-23T12:30:00.142Z",
+  "trace_id": "0199...",
+  "idempotency_key": "github-delivery-123",
+  "payload_ref": "payload/2026/09/23/0199..."
+}
+```
+
+A database change is an event.
+
+A webhook is an event.
+
+A replay request creates another execution from an event.
+
+An API contract change creates an event.
+
+A synchronization conflict creates an event.
+
+A failed migration test creates an event.
+
+This common abstraction is what makes merging the projects technically sensible.
+
+---
+
+# 4. System Architecture
+
+## 4.1 Logical architecture
+
+```text
+                         EVENTFORGE
+┌───────────────────────────────────────────────────────────────────┐
+│                                                                   │
+│                         FRONTEND                                  │
+│                                                                   │
+│ Dashboard | Events | Webhooks | Automations | Replay | Traces    │
+│ Gateway | Chaos | DB Events | API Watch | Sync | Migration Lab   │
+│                                                                   │
+└─────────────────────────────┬─────────────────────────────────────┘
+                              │ HTTPS
+                              ▼
+                    ┌─────────────────────┐
+                    │ Python Control API  │
+                    │                     │
+                    │ users/projects      │
+                    │ configurations      │
+                    │ workflows           │
+                    │ querying            │
+                    │ administration      │
+                    └──────────┬──────────┘
+                               │
+                               ▼
+                        PostgreSQL
+                               ▲
+                               │
+                ┌──────────────┴─────────────┐
+                │                            │
+                │                            │
+        ┌───────┴────────┐            ┌──────┴───────┐
+        │ C++ Data Plane │            │ C Event Core │
+        │                │            │              │
+        │ HTTP gateway   │            │ append log   │
+        │ rate limiter   │            │ checksums    │
+        │ worker engine  │            │ recovery     │
+        │ proxy          │            │ indexing     │
+        │ replay         │            │ binary I/O   │
+        └───────┬────────┘            └──────────────┘
+                │
+        ┌───────┼─────────────────────────────────────────┐
+        │       │                │                        │
+        ▼       ▼                ▼                        ▼
+    Webhooks  External APIs  Test services           Databases
+```
+
+---
+
+# 5. Why We Do Not Start With Microservices
+
+A major architectural decision is to **not** initially create ten network services.
+
+That would teach deployment complexity before teaching the system itself.
+
+Initially we use a modular monolith plus two primary runtime processes:
+
+```text
+Process 1
+Python control plane
+
+Process 2
+C++ data plane
+```
+
+and one shared C library.
+
+The project boundaries are logical:
+
+```text
+modules/webhooks
+modules/replay
+modules/automation
+modules/tracing
+...
+```
+
+not necessarily deployment boundaries.
+
+Later, if FaultMesh needs independent scaling, it can become another service.
+
+This follows a useful engineering rule:
+
+> Create a service boundary because you need independent scaling, security or failure isolation—not because the folder has a different name.
+
+---
+
+# 6. Responsibility of Each Language
+
+## C
+
+C is where we deliberately learn low-level systems engineering.
+
+Responsibilities eventually include:
+
+```text
+binary event storage
+file formats
+checksums
+ring buffers
+memory ownership
+mmap()
+file descriptors
+system calls
+crash recovery
+buffer management
+Linux-specific experiments
+```
+
+Initial language baseline:
+
+```text
+C17
+```
+
+rather than requiring C23 immediately.
+
+Why?
+
+C17 has extremely broad compiler/tool support and maps well to systems software. Later experiments can introduce C23 features deliberately.
+
+---
+
+## C++
+
+C++ becomes the network/data-plane language.
+
+Baseline:
+
+```text
+C++20
+```
+
+Responsibilities:
+
+```text
+HTTP gateway
+worker pool
+rate limiting
+concurrent replay
+FaultMesh
+network proxying
+connection management
+threading
+async I/O
+epoll on Linux
+```
+
+Later we can investigate selected C++23 functionality.
+
+The objective is understanding modern C++ ownership and concurrency rather than merely using newer syntax.
+
+---
+
+## Python
+
+Python is the control-plane/orchestration language.
+
+Current stable Python at the time of this report is Python **3.14.7**, released August 5, 2026.
+
+Responsibilities:
+
+```text
+REST API
+workflow definitions
+authentication integration
+database administration
+analytics
+API schema comparison
+connector development
+administrative jobs
+testing tools
+simulators
+```
+
+FastAPI will be used initially.
+
+FastAPI's own documentation recommends pinning the version known to work because the project still uses `0.x` semantic versions and minor-version changes may contain breaking changes. Therefore we will pin the exact FastAPI version in our dependency lock rather than hard-coding a forever-version in this architecture document.
+
+---
+
+# 7. Database
+
+Use PostgreSQL.
+
+Current PostgreSQL production major version is **18**, with PostgreSQL **18.6** released August 13, 2026. PostgreSQL 19 remains in beta as of this report, so we do **not** build against PostgreSQL 19.
+
+Development baseline:
+
+```text
+PostgreSQL 18.x
+```
+
+We pin the Docker image/digest used by CI for reproducibility.
+
+PostgreSQL is used because this project needs to learn:
+
+```text
+transactions
+indexes
+locking
+isolation
+JSON
+queues
+outbox patterns
+connection pooling
+query plans
+schema migrations
+eventual consistency
+logical replication
+```
+
+PostgreSQL 18 supports logical replication through a publisher/subscriber architecture in which changes are generated from WAL and continuously sent to subscribers. That becomes important later for ChangeWire.
+
+---
+
+# 8. Frontend Architecture
+
+There will be **one frontend application**, but each project becomes a separate user-facing tool.
+
+Example routes:
+
+```text
+/
+ /dashboard
+
+ /projects/:id/events
+ /projects/:id/webhooks
+ /projects/:id/automations
+ /projects/:id/replay
+ /projects/:id/traces
+ /projects/:id/gateway
+ /projects/:id/chaos
+ /projects/:id/database-events
+ /projects/:id/api-watch
+ /projects/:id/sync
+ /projects/:id/migrations
+```
+
+Visually:
+
+```text
+┌────────────────────────────┐
+│ EVENTFORGE                 │
+├────────────────────────────┤
+│ Dashboard                  │
+│ Events                     │
+│ Webhooks                   │
+│ Automations                │
+│ Replay                     │
+│ Traces                     │
+│ API Gateway                │
+│ Chaos Testing              │
+│ Database Events            │
+│ API Watch                  │
+│ Synchronization            │
+│ Migration Lab              │
+└────────────────────────────┘
+```
+
+Each feels like its own product.
+
+But all use:
+
+```text
+same login
+same project
+same events
+same API
+same database
+same traces
+```
+
+The frontend should remain relatively thin.
+
+The engineering work is the infrastructure underneath it.
+
+---
+
+# 9. Repository Architecture
+
+```text
+eventforge/
+│
+├── apps/
+│   ├── web/
+│   │   └── React/TypeScript frontend
+│   │
+│   └── api/
+│       └── Python/FastAPI control plane
+│
+├── services/
+│   ├── gateway/
+│   │   └── C++ HTTP/data plane
+│   │
+│   └── executor/
+│       └── C++ worker/replay execution
+│
+├── libs/
+│   ├── eventlog/
+│   │   └── C durable event-storage library
+│   │
+│   ├── cpp-core/
+│   │
+│   └── python-sdk/
+│
+├── modules/
+│   ├── webhooks/
+│   ├── replay/
+│   ├── automations/
+│   ├── tracing/
+│   ├── gateway/
+│   ├── chaos/
+│   ├── db-events/
+│   ├── api-watch/
+│   ├── sync/
+│   └── migration-lab/
+│
+├── database/
+│   ├── migrations/
+│   ├── seeds/
+│   └── test-data/
+│
+├── infrastructure/
+│   ├── docker/
+│   ├── local/
+│   └── cloud/
+│
+├── tests/
+│   ├── unit/
+│   ├── integration/
+│   ├── contract/
+│   ├── load/
+│   ├── chaos/
+│   └── security/
+│
+├── tools/
+│   ├── simulator/
+│   └── benchmarks/
+│
+├── docs/
+│   ├── architecture/
+│   ├── adr/
+│   ├── api/
+│   └── protocol/
+│
+└── .github/
+    └── workflows/
+```
+
+---
+
+# 10. Local-First Development Environment
+
+The primary development environment is the laptop.
+
+That is intentional.
+
+The local machine gives us complete control over:
+
+```text
+process crashes
+database restarts
+network failures
+files
+disk corruption experiments
+debuggers
+sanitizers
+strace
+gdb
+perf
+epoll
+PostgreSQL configuration
+logical replication
+C storage
+migration testing
+```
+
+Free hosted platforms cannot safely give us all of that.
+
+---
+
+# 11. Recommended Local Environment
+
+For deep C/Linux study, Linux should be the execution environment.
+
+Preferred:
+
+```text
+Linux machine
+```
+
+or:
+
+```text
+Windows
+  ↓
+WSL2
+  ↓
+Ubuntu/Linux
+```
+
+or on macOS:
+
+```text
+macOS
+  ↓
+Linux containers/VM
+```
+
+because Linux-specific APIs such as:
+
+```text
+epoll
+procfs
+perf
+Linux signals
+some mmap behaviour
+Linux socket options
+```
+
+are part of what we eventually want to study.
+
+Core development tools:
+
+```text
+Git
+Docker
+Docker Compose v2
+
+GCC
+Clang
+CMake
+Make/Ninja
+
+GDB
+Valgrind
+strace
+perf
+
+Python 3.14
+uv
+
+PostgreSQL client tools
+
+Node current LTS
+TypeScript
+React/Vite
+```
+
+Dependency versions will be locked in repository files rather than relying on whatever happens to be installed globally.
+
+---
+
+# 12. First Local Architecture
+
+Before C++ networking or C storage exists:
+
+```text
+Browser
+   │
+   ▼
+React frontend
+localhost:5173
+   │
+   ▼
+Python FastAPI
+localhost:8000
+   │
+   ├───────────────┐
+   ▼               ▼
+PostgreSQL      Python worker
+localhost:5432
+```
+
+Everything can initially run through Docker Compose.
+
+FastAPI explicitly documents Linux-container deployment as a standard deployment approach, which also makes the local container environment closely resemble later cloud deployment.
+
+---
+
+# 13. Versioning Strategy
+
+Application releases follow Semantic Versioning:
+
+```text
+MAJOR.MINOR.PATCH
+```
+
+During development:
+
+```text
+0.x
+```
+
+means interfaces can change.
+
+Example:
+
+```text
+0.1.0
+0.2.0
+0.3.0
+...
+```
+
+At:
+
+```text
+1.0.0
+```
+
+public REST/API compatibility begins to matter.
+
+Workflow definitions have their **own version numbers**.
+
+An old execution must always remember which workflow version produced it.
+
+---
+
+# 14. Development Milestones
+
+There are no arbitrary calendar deadlines.
+
+A version is complete only when its **exit criteria** pass.
+
+That is our meaning of “when”.
+
+---
+
+## v0.0 — Engineering Foundation
+
+### Project modules
+
+None yet.
+
+### What?
+
+Create the repository, local infrastructure and CI skeleton.
+
+### Why?
+
+Every later module needs a reproducible foundation.
+
+### Where?
+
+Laptop only.
+
+### Who?
+
+You acting as:
+
+```text
+build engineer
+backend engineer
+database engineer
+```
+
+### How?
+
+Set up:
+
+```text
+Git repository
+Docker Compose
+PostgreSQL
+FastAPI
+frontend
+C build
+C++ build
+pytest
+C/C++ unit test framework
+formatters
+linters
+CI
+```
+
+### Exit criteria
+
+A fresh clone can run one command and produce:
+
+```text
+frontend
+API
+PostgreSQL
+```
+
+with all tests passing.
+
+---
+
+# 15. v0.1 — HookLedger
+
+### Project
+
+**HookLedger**
+
+### What?
+
+Reliable webhook ingestion.
+
+### Why?
+
+This creates the platform's first real event source.
+
+### Where?
+
+Laptop.
+
+### How?
+
+Endpoint:
+
+```text
+POST /ingest/{endpoint_token}
+```
+
+Request:
+
+```text
+Internet/application
+        ↓
+     FastAPI
+        ↓
+ PostgreSQL transaction
+        ↓
+      event
+        +
+       job
+```
+
+Only after the transaction commits do we return:
+
+```text
+202 Accepted
+```
+
+GitHub officially recommends webhook receivers return a successful response within 10 seconds and suggests asynchronous queue processing.
+
+### Required features
+
+```text
+endpoint creation
+secret generation
+event persistence
+payload storage
+unique delivery ID
+event history
+delivery attempts
+basic authentication
+```
+
+### Exit criteria
+
+Duplicate requests cannot accidentally create duplicate logical events when an idempotency key is supplied.
+
+---
+
+# 16. Idempotency Model
+
+Webhook delivery is not assumed to be exactly once.
+
+The platform uses:
+
+```text
+AT-LEAST-ONCE DELIVERY
++
+IDEMPOTENCY
+```
+
+For example:
+
+```text
+UNIQUE(endpoint_id, provider_delivery_id)
+```
+
+GitHub specifically recommends using its delivery identifier to distinguish deliveries and detect replayed deliveries.
+
+If event `X` arrives five times:
+
+```text
+X
+X
+X
+X
+X
+```
+
+the database should still produce:
+
+```text
+one logical event
+```
+
+unless the user explicitly requests independent processing.
+
+---
+
+# 17. v0.2 — Reliable Jobs and Retries
+
+Still primarily HookLedger infrastructure.
+
+Add:
+
+```text
+jobs
+leases
+attempts
+retries
+dead-letter state
+```
+
+Job state:
+
+```text
+PENDING
+   ↓
+RUNNING
+   ↓
+ ┌──────────────┐
+ │              │
+SUCCESS      RETRY_WAIT
+                │
+                ▼
+             PENDING
+                │
+                ▼
+          DEAD_LETTERED
+```
+
+A worker claims jobs with database locking.
+
+Conceptually:
+
+```sql
+SELECT ...
+FOR UPDATE SKIP LOCKED
+```
+
+This allows multiple workers to claim different jobs without performing the same job simultaneously.
+
+---
+
+# 18. Retry Equation
+
+Use exponential backoff with jitter.
+
+For attempt `n`:
+
+$$
+D_n = \min(D_{max}, D_0 \times 2^n) + J
+$$
+
+where:
+
+```text
+D0    = initial delay
+Dmax  = maximum retry delay
+n     = retry number
+J     = random jitter
+```
+
+Example:
+
+```text
+2 s
+4 s
+8 s
+16 s
+32 s
+...
+max 600 s
+```
+
+Jitter prevents thousands of failed jobs from waking up simultaneously.
+
+---
+
+# 19. v0.3 — ReplayDB
+
+### Project
+
+**ReplayDB**
+
+### What?
+
+Replay previously received events.
+
+### Why?
+
+Production bugs are often difficult to reproduce.
+
+### How?
+
+Original event:
+
+```text
+event ABC
+```
+
+Replay produces:
+
+```text
+new execution XYZ
+replay_of = ABC
+```
+
+The original event never changes.
+
+The user can select:
+
+```text
+Replay with original workflow version
+
+or
+
+Replay with current workflow version
+```
+
+This distinction is critical for debugging.
+
+### First implementation
+
+Payloads remain in PostgreSQL.
+
+No custom C storage yet.
+
+### Exit criteria
+
+An event can be replayed without modifying its historical record.
+
+---
+
+# 20. v0.4 — FlowTrace
+
+### Project
+
+**FlowTrace**
+
+### What?
+
+Reliable automation workflows.
+
+### Initial workflow structure
+
+```text
+TRIGGER
+   ↓
+CONDITION
+   ↓
+ACTION
+   ↓
+ACTION
+```
+
+Example:
+
+```text
+WHEN github.push
+
+IF branch == main
+
+POST https://example.test/build
+
+WAIT 10 seconds
+
+POST https://example.test/report
+```
+
+Do **not** initially allow arbitrary executable Python or JavaScript.
+
+Initial safe action types:
+
+```text
+HTTP request
+delay
+JSON transform
+conditional
+emit event
+```
+
+### Why?
+
+Arbitrary code execution immediately creates major sandboxing and security problems.
+
+### Persistence
+
+Each step gets stored:
+
+```text
+workflow
+workflow_version
+workflow_run
+step_run
+```
+
+After each successful step, state is committed.
+
+Therefore:
+
+```text
+process crashes
+```
+
+does not mean:
+
+```text
+entire workflow lost
+```
+
+### Exit criteria
+
+Kill the worker halfway through a workflow.
+
+Restart it.
+
+Execution safely resumes.
+
+---
+
+# 21. The Exactly-Once Problem
+
+We should never claim:
+
+> EventForge guarantees exactly-once external side effects.
+
+Imagine:
+
+```text
+EventForge
+   ↓
+POST payment API
+   ↓
+payment succeeds
+   ↓
+EventForge crashes
+   ↓
+before recording success
+```
+
+After restart, EventForge cannot know with certainty whether the external API completed the operation.
+
+Therefore industrial design is:
+
+```text
+at-least-once execution
++
+idempotency keys
++
+deduplication
++
+documented semantics
+```
+
+Where an external API supports idempotency keys, EventForge forwards one.
+
+Otherwise exactly-once side effects are generally impossible to guarantee across an uncontrolled remote service.
+
+This is an important distributed-systems lesson.
+
+---
+
+# 22. v0.5 — TracePocket
+
+### Project
+
+**TracePocket**
+
+### What?
+
+Trace a request through the system.
+
+Every incoming event obtains:
+
+```text
+trace_id
+```
+
+Operations obtain:
+
+```text
+span_id
+```
+
+Example:
+
+```text
+TRACE abc
+
+Webhook ingestion        12 ms
+Database commit           7 ms
+Queue waiting            32 ms
+Workflow execution       14 ms
+External API           1284 ms
+Database update           6 ms
+```
+
+OpenTelemetry defines telemetry around traces, metrics, logs and baggage; we will adopt compatible concepts instead of inventing incompatible terminology.
+
+Initially our database stores simplified spans.
+
+Later we can export actual OpenTelemetry data.
+
+---
+
+# 23. v0.6 — QuotaGate
+
+### Project
+
+**QuotaGate**
+
+### Main language
+
+C++.
+
+### What?
+
+A real HTTP gateway.
+
+Architecture changes:
+
+```text
+client
+   ↓
+C++ gateway
+   ↓
+Python control API
+```
+
+Responsibilities:
+
+```text
+HTTP parsing
+request IDs
+API keys
+rate limiting
+concurrency limits
+request size limits
+forwarding
+timeouts
+basic metrics
+```
+
+---
+
+# 24. Token Bucket Rate-Limit Equation
+
+Each client owns a bucket.
+
+Let:
+
+```text
+B = maximum bucket capacity
+r = token refill rate per second
+T = current tokens
+Δt = elapsed time
+```
+
+Then:
+
+$$
+T_{new} = \min(B, T + r\Delta t)
+$$
+
+For one request:
+
+```text
+if Tnew >= 1:
+    accept
+    Tnew -= 1
+else:
+    HTTP 429
+```
+
+Example:
+
+```text
+B = 100
+r = 20 requests/sec
+```
+
+allows short bursts up to 100 while sustaining approximately 20 requests/second.
+
+---
+
+# 25. v0.7 — C Event Store
+
+### Project
+
+ReplayDB low-level engine.
+
+### What?
+
+Replace part of the educational event-storage path with a C implementation.
+
+This is where deep C begins.
+
+### Important rule
+
+The initial C store is **not immediately the only copy of important data**.
+
+We first build and test it beside PostgreSQL.
+
+---
+
+# 26. Proposed Binary Record Format
+
+Conceptually:
+
+```text
+┌───────────────────────┐
+│ magic          4 B    │
+│ format version 2 B    │
+│ flags          2 B    │
+│ record length  4 B    │
+│ payload length 4 B    │
+│ timestamp      8 B    │
+│ event UUID    16 B    │
+│ CRC32C         4 B    │
+│ payload        N B    │
+└───────────────────────┘
+```
+
+Never write an in-memory C struct directly to disk.
+
+Bad:
+
+```c
+write(fd, &my_struct, sizeof(my_struct));
+```
+
+because layout can be affected by:
+
+```text
+padding
+alignment
+endianness
+compiler
+architecture
+```
+
+Instead every integer field is serialized explicitly using fixed-width types such as:
+
+```text
+uint16_t
+uint32_t
+uint64_t
+```
+
+---
+
+# 27. C Event-Store Operations
+
+Public C API may eventually resemble:
+
+```text
+ev_store_open()
+ev_store_append()
+ev_store_read()
+ev_store_scan()
+ev_store_sync()
+ev_store_recover()
+ev_store_close()
+```
+
+Concepts learned:
+
+```text
+open()
+read()
+write()
+pread()
+pwrite()
+fsync()
+mmap()
+munmap()
+
+file descriptors
+partial writes
+memory ownership
+checksums
+crash recovery
+```
+
+---
+
+# 28. Crash Recovery
+
+Suppose the machine dies while writing:
+
+```text
+record 100
+record 101
+record 102 HALF WRITTEN
+```
+
+At startup:
+
+```text
+scan record 100 → valid
+scan record 101 → valid
+scan record 102 → CRC/length invalid
+```
+
+Recovery truncates the invalid tail.
+
+```text
+100
+101
+```
+
+remain valid.
+
+This becomes a practical introduction to database/storage-engine concepts.
+
+---
+
+# 29. v0.8 — FaultMesh
+
+### Project
+
+**FaultMesh**
+
+### Primary language
+
+C++.
+
+### What?
+
+Programmable failure proxy.
+
+```text
+application
+    ↓
+FaultMesh
+    ↓
+target API
+```
+
+Rules might say:
+
+```text
+delay 500 ms
+
+fail 20%
+
+return 429
+
+disconnect after headers
+
+timeout request
+```
+
+### Why?
+
+Now EventForge can test **itself**.
+
+Example:
+
+```text
+FlowTrace
+   ↓
+FaultMesh
+   ↓
+mock destination
+```
+
+We can intentionally break requests and verify retry behaviour.
+
+### Security requirement
+
+FaultMesh must never become an unauthenticated public open proxy.
+
+Public users may only target approved/registered destinations.
+
+Internal IP ranges and cloud metadata addresses must be blocked.
+
+---
+
+# 30. v0.9 — ChangeWire
+
+### Project
+
+**ChangeWire**
+
+### First implementation
+
+Use the transactional outbox pattern.
+
+Example business transaction:
+
+```text
+BEGIN
+
+UPDATE orders
+SET status = 'paid';
+
+INSERT INTO event_outbox (...);
+
+COMMIT
+```
+
+Either both happen:
+
+```text
+order updated
+event created
+```
+
+or neither happens.
+
+This is far safer than:
+
+```text
+update DB
+
+then
+
+send message
+
+and hope nothing crashes between them
+```
+
+Later, on local PostgreSQL, we experiment with logical replication.
+
+PostgreSQL logical replication publishes database changes and allows subscribers to consume them while preserving transactional ordering within a subscription.
+
+Logical replication experiments remain local initially because managed database permissions vary between providers.
+
+---
+
+# 31. v0.10 — DriftLens
+
+### Project
+
+**DriftLens**
+
+### What?
+
+Monitor an API for unexpected behaviour/schema changes.
+
+Input:
+
+```text
+OpenAPI document
++
+API URL
+```
+
+Output:
+
+```text
+field removed
+field added
+type changed
+status code changed
+latency changed
+enum changed
+```
+
+Initial monitoring uses:
+
+```text
+GET
+HEAD
+```
+
+unless the user explicitly configures safe test operations.
+
+Store:
+
+```text
+api_monitor
+snapshot
+observation
+schema_change
+```
+
+---
+
+# 32. v0.11 — SyncForge
+
+### Project
+
+**SyncForge**
+
+### What?
+
+Synchronize two data sources.
+
+Initially create two fake systems:
+
+```text
+CRM-A
+CRM-B
+```
+
+Then:
+
+```text
+CRM-A
+   ↕
+SyncForge
+   ↕
+CRM-B
+```
+
+Learn:
+
+```text
+sync cursors
+versions
+tombstones
+conflicts
+retry
+mapping
+eventual consistency
+```
+
+Initial conflict policies:
+
+```text
+source A wins
+source B wins
+latest timestamp wins
+manual resolution
+```
+
+The UI must show conflicts rather than silently hiding them.
+
+---
+
+# 33. v0.12 — MigrationSentinel
+
+### Project
+
+**MigrationSentinel**
+
+### What?
+
+Test SQL migrations under concurrent application traffic.
+
+### Where?
+
+Initially **local only**.
+
+Migration testing needs a disposable database with significant privileges.
+
+Architecture:
+
+```text
+temporary PostgreSQL
+         │
+     test schema
+         │
+ ┌───────┴────────┐
+ │                │
+migration      load generator
+ │                │
+ └───────┬────────┘
+         ▼
+      metrics
+```
+
+Report:
+
+```text
+migration duration
+lock waits
+blocked queries
+P50 latency
+P95 latency
+P99 latency
+failed queries
+```
+
+It must never run user-submitted migration experiments against EventForge's production database.
+
+---
+
+# 34. v1.0 — Public Release
+
+At this point the public platform contains usable versions of the major modules.
+
+The initial public release does not need every advanced feature.
+
+Core v1.0 promise:
+
+```text
+Receive
+Store
+Automate
+Observe
+Replay
+Protect
+Test
+```
+
+---
+
+# 35. Local vs Cloud Responsibility
+
+## Laptop
+
+The laptop remains responsible for advanced engineering development:
+
+```text
+C event store
+kernel/Linux experiments
+logical replication
+migration laboratory
+sanitizers
+fuzzing
+large load tests
+fault injection
+database restarts
+low-level debugging
+```
+
+## Public cloud
+
+The public deployment demonstrates:
+
+```text
+real HTTPS APIs
+webhook ingestion
+authentication
+events
+automations
+replays
+traces
+rate limiting
+public frontend
+limited FaultMesh
+API monitoring
+```
+
+This separation is intentional.
+
+---
+
+# 36. Proposed Free Public Architecture
+
+```text
+                     INTERNET
+                        │
+                        ▼
+               C++ EventForge Gateway
+                  Northflank service
+                        │
+                        ▼
+                 Python Control API
+                  Northflank service
+                        │
+                        ▼
+               Supabase PostgreSQL
+                        │
+              ┌─────────┴─────────┐
+              │                   │
+              ▼                   ▼
+       Cloudflare R2        GitHub Pages
+       payload archive       frontend
+```
+
+Optional later:
+
+```text
+Cloudflare Worker
+        +
+Cloudflare Queue
+```
+
+can sit in front if we want a globally available buffering layer.
+
+---
+
+# 37. Why Northflank Is Attractive for This Project
+
+As of September 2026, Northflank's free Sandbox advertises:
+
+```text
+2 free services
+1 free database
+2 free cron jobs
+always-on compute
+no sleeping
+```
+
+which is unusually suitable for our two-runtime architecture.
+
+We can use:
+
+```text
+service 1 → Python control plane
+
+service 2 → C++ data plane
+```
+
+The database can either use Northflank's included database or remain on Supabase depending on which environment proves easier and more predictable during deployment.
+
+We should treat all free-hosting plans as replaceable adapters because providers can change limits.
+
+---
+
+# 38. Supabase Free Database
+
+As of this report, Supabase's Free plan advertises:
+
+```text
+500 MB PostgreSQL database
+
+500 MB RAM
+shared CPU
+
+5 GB egress
+5 GB cached egress
+
+1 GB file storage
+
+50,000 monthly active users
+
+2 active projects
+```
+
+Free projects can pause after one week of inactivity.
+
+Therefore:
+
+> PostgreSQL should contain metadata and important structured state, not unlimited raw payload history forever.
+
+---
+
+# 39. Cloudflare R2
+
+R2 is attractive for archived event payloads.
+
+Its current free tier provides:
+
+```text
+10 GB-month storage
+
+1,000,000 Class A operations/month
+
+10,000,000 Class B operations/month
+
+free internet egress
+```
+
+for Standard storage.
+
+Architecture:
+
+```text
+PostgreSQL
+│
+├── event ID
+├── timestamp
+├── type
+├── metadata
+└── payload_object_key
+           │
+           ▼
+     Cloudflare R2
+           │
+      actual payload
+```
+
+This prevents large webhook bodies from consuming all of the PostgreSQL free storage.
+
+---
+
+# 40. Rough Event-Storage Equation
+
+Let:
+
+$$
+N = \text{events per day}
+$$
+
+$$
+P = \text{average payload bytes}
+$$
+
+$$
+M = \text{metadata bytes per event}
+$$
+
+Then approximately:
+
+$$
+Storage_{day}=N(P+M)
+$$
+
+For:
+
+```text
+N = 5,000
+P = 10 KB
+M = 1 KB
+```
+
+approximately:
+
+$$
+5000\times11000=55,000,000
+$$
+
+or about:
+
+```text
+55 MB/day
+```
+
+Raw event bodies clearly should not stay indefinitely inside a 500 MB free PostgreSQL database.
+
+Archive storage exists for this reason.
+
+---
+
+# 41. R2 Capacity Example
+
+Ignoring metadata/compression/operation limits, for an average 10 KB payload:
+
+$$
+\frac{10,000,000,000}{10,000}
+\approx1,000,000
+$$
+
+So 10 GB can theoretically hold roughly one million 10 KB payloads.
+
+Actual usable capacity will be somewhat lower depending on representation and additional objects.
+
+---
+
+# 42. GitHub Pages
+
+GitHub Pages can host the static EventForge frontend.
+
+GitHub currently documents:
+
+```text
+1 GB recommended source-repository size
+1 GB published-site maximum
+100 GB/month soft bandwidth limit
+10 builds/hour soft limit
+```
+
+with the build limit not applying in the same way when using a custom GitHub Actions workflow.
+
+Our static dashboard should consume only a tiny fraction of those limits at learning/demo scale.
+
+---
+
+# 43. GitHub Actions
+
+For a public open-source repository, standard GitHub-hosted Actions runners are free.
+
+Every pull request can therefore run:
+
+```text
+C compile
+C tests
+ASan/UBSan build
+
+C++ compile
+C++ tests
+
+Python tests
+Python type checks
+
+frontend build
+
+PostgreSQL integration tests
+
+API contract tests
+```
+
+---
+
+# 44. Optional Cloudflare Worker Edge
+
+Cloudflare Workers Free currently provides:
+
+```text
+100,000 requests/day
+10 ms CPU/request
+128 MB memory
+```
+
+and has a 100 MB request-body limit for Free accounts.
+
+This means a Worker is excellent for:
+
+```text
+light authentication
+routing
+request rejection
+queue insertion
+edge headers
+```
+
+but not where we should run CPU-heavy EventForge logic.
+
+---
+
+# 45. Optional Cloudflare Queue
+
+Queues are useful if eventually we want:
+
+```text
+internet
+   ↓
+edge
+   ↓
+durable buffer
+   ↓
+EventForge
+```
+
+Workers Free currently includes:
+
+```text
+10,000 queue operations/day
+24-hour retention
+128 KB max message
+```
+
+with up to 100 message retries supported by the queue platform limits.
+
+Cloudflare explains that a normal successful delivery commonly requires:
+
+```text
+1 write
+1 read
+1 delete
+```
+
+or approximately three operations.
+
+Therefore:
+
+$$
+Messages_{day}\approx\frac{10,000}{3}
+$$
+
+$$
+Messages_{day}\approx3,333
+$$
+
+assuming:
+
+```text
+messages <= 64 KB
+no retries
+normal lifecycle
+```
+
+So the free queue is useful but should not become an architectural dependency for unlimited throughput.
+
+---
+
+# 46. Render as Fallback, Not Primary
+
+Render's free web service is a valid alternative for demonstration purposes.
+
+However, Render currently spins a free service down after 15 minutes without inbound traffic, and waking can take approximately a minute. Its local filesystem is also ephemeral, and the workspace receives 750 free instance-hours per month.
+
+That is bad for a webhook receiver requiring quick acknowledgement.
+
+Therefore if we ever use Render:
+
+```text
+Internet
+   ↓
+Cloudflare Worker
+   ↓
+Queue
+   ↓
+Render
+```
+
+would be safer than exposing a sleeping Render service directly as the webhook ingestion endpoint.
+
+---
+
+# 47. PostgreSQL Core Tables
+
+Initial conceptual schema:
+
+```text
+users
+projects
+project_members
+
+api_keys
+
+ingress_endpoints
+
+events
+event_payloads
+
+jobs
+job_attempts
+
+destinations
+deliveries
+delivery_attempts
+
+workflows
+workflow_versions
+workflow_runs
+step_runs
+
+traces
+spans
+
+rate_limit_policies
+
+fault_rules
+
+db_sources
+outbox_events
+
+api_monitors
+api_snapshots
+api_changes
+
+sync_connections
+sync_cursors
+sync_conflicts
+
+migration_tests
+migration_results
+```
+
+Every tenant-owned table contains:
+
+```text
+project_id
+```
+
+to enforce isolation.
+
+---
+
+# 48. Core Event State
+
+Event payload is immutable.
+
+Do not repeatedly mutate:
+
+```text
+events.status
+```
+
+to describe everything that ever happened.
+
+Instead:
+
+```text
+EVENT
+   │
+   ├── deliveries
+   ├── workflow runs
+   ├── traces
+   ├── replay executions
+   └── audit records
+```
+
+Historical behaviour remains reconstructable.
+
+---
+
+# 49. Primary Event Flow
+
+```text
+1. Request arrives
+
+2. Validate endpoint
+
+3. Validate authentication/signature
+
+4. Determine idempotency identity
+
+5. Begin DB transaction
+
+6. Insert immutable event
+
+7. Insert processing job
+
+8. Commit
+
+9. Return 202
+
+10. Worker claims job
+
+11. Execute workflow
+
+12. Store every attempt
+
+13. Record trace spans
+
+14. Mark execution complete
+```
+
+Step 8 happens before step 9.
+
+We never tell the sender:
+
+```text
+accepted
+```
+
+before durable persistence has succeeded.
+
+---
+
+# 50. Worker Capacity Equation
+
+Let:
+
+$$
+\lambda = \text{incoming jobs/second}
+$$
+
+$$
+S = \text{average processing seconds/job}
+$$
+
+$$
+N = \text{workers}
+$$
+
+Approximate utilization:
+
+$$
+\rho=\frac{\lambda S}{N}
+$$
+
+For safety we may initially target:
+
+$$
+\rho < 0.7
+$$
+
+Therefore:
+
+$$
+N \geq \left\lceil\frac{\lambda S}{0.7}\right\rceil
+$$
+
+Example:
+
+```text
+λ = 20 jobs/sec
+S = 0.1 sec
+```
+
+$$
+N\geq\frac{20\times0.1}{0.7}
+$$
+
+$$
+N\geq2.86
+$$
+
+so:
+
+```text
+3 workers minimum
+```
+
+for that approximate target.
+
+---
+
+# 51. Little's Law
+
+Another useful systems equation:
+
+$$
+L=\lambda W
+$$
+
+where:
+
+```text
+L = average number of jobs in the system
+λ = arrival rate
+W = average time in system
+```
+
+If:
+
+```text
+100 jobs/sec
+```
+
+and average processing/queue time is:
+
+```text
+0.2 sec
+```
+
+then:
+
+$$
+L=100\times0.2=20
+$$
+
+approximately 20 jobs will be in-flight on average.
+
+These equations will become useful when we load-test EventForge rather than guessing how many workers it needs.
+
+---
+
+# 52. Security Architecture
+
+Security is part of the project, not something added after v1.
+
+Initial requirements:
+
+```text
+HTTPS in public deployments
+
+hashed API keys
+
+short identifiers separate from secrets
+
+HMAC webhook signatures
+
+timing-safe signature comparison
+
+payload size limits
+
+request timeout limits
+
+response size limits
+
+project-based authorization
+
+secret encryption
+
+audit logs
+
+credential redaction
+
+rate limiting
+
+CORS restrictions
+
+SQL parameters
+
+input validation
+```
+
+---
+
+# 53. SSRF Is a Major Risk
+
+EventForge lets users ask it to call URLs.
+
+That can accidentally create an SSRF service.
+
+Therefore public HTTP actions must reject targets resolving to:
+
+```text
+127.0.0.0/8
+
+10.0.0.0/8
+
+172.16.0.0/12
+
+192.168.0.0/16
+
+169.254.0.0/16
+
+::1
+
+private/local IPv6 ranges
+
+cloud metadata endpoints
+```
+
+unless an explicitly trusted private deployment enables them.
+
+DNS must be checked carefully to defend against rebinding.
+
+Only:
+
+```text
+https
+```
+
+should be enabled publicly by default.
+
+---
+
+# 54. FaultMesh Abuse Prevention
+
+A public failure-testing proxy could otherwise become an abuse tool.
+
+Therefore:
+
+```text
+authentication mandatory
+
+target registration mandatory
+
+private/internal networks blocked
+
+maximum bandwidth
+
+maximum response size
+
+maximum request duration
+
+per-user rate limits
+
+audit logs
+```
+
+For early public versions, FaultMesh can be restricted to:
+
+```text
+user-owned test URLs
+or
+EventForge's own mock endpoints
+```
+
+---
+
+# 55. Data Privacy
+
+Webhook payloads can contain secrets or personal information.
+
+Therefore:
+
+```text
+configurable retention
+payload deletion
+redaction
+no payloads in ordinary application logs
+encrypted provider secrets
+project isolation
+minimal telemetry
+```
+
+The public free version should explicitly be labelled experimental and users should not be encouraged to route sensitive production data through it until the security model has matured.
+
+---
+
+# 56. Testing Strategy
+
+We build multiple layers of tests.
+
+### Unit tests
+
+Single function/class/module.
+
+### Integration tests
+
+```text
+API + PostgreSQL
+gateway + API
+worker + database
+```
+
+### Contract tests
+
+Verify HTTP schemas and event formats.
+
+### Failure tests
+
+Kill workers at intentional points.
+
+### Load tests
+
+Thousands/millions of simulated events.
+
+### Security tests
+
+Malformed requests, oversized payloads, invalid signatures and SSRF attempts.
+
+### Recovery tests
+
+Corrupt/truncate C event-log segments and verify recovery.
+
+---
+
+# 57. C/C++ Tooling
+
+Debug builds should enable compiler warnings aggressively.
+
+For C/C++ development we will use:
+
+```text
+AddressSanitizer
+UndefinedBehaviorSanitizer
+ThreadSanitizer where applicable
+
+GDB
+Valgrind
+strace
+perf
+```
+
+Release builds do not hide compiler warnings.
+
+The long-term objective is to reach:
+
+```text
+-Wall
+-Wextra
+-Wpedantic
+```
+
+plus carefully selected additional warnings without ignoring warnings casually.
+
+---
+
+# 58. Failure Scenarios We Must Deliberately Test
+
+The project is not complete because the happy path works.
+
+We intentionally test:
+
+```text
+duplicate webhook
+
+invalid signature
+
+database unavailable
+
+database connection drops
+
+worker dies before processing
+
+worker dies during processing
+
+worker dies after external side effect
+
+destination returns 500
+
+destination returns 429
+
+destination times out
+
+destination responds slowly
+
+payload is malformed
+
+payload is huge
+
+event is replayed repeatedly
+
+two workers claim jobs
+
+API schema changes
+
+disk fills locally
+
+C event log is truncated
+
+C event log gets invalid checksum
+
+migration holds lock
+
+sync systems modify same record
+
+system restarts during workflow
+```
+
+This is where most of the engineering education occurs.
+
+---
+
+# 59. Observability Requirements
+
+At minimum every service logs structured records containing:
+
+```text
+timestamp
+severity
+service
+project_id
+event_id
+trace_id
+request_id
+operation
+duration
+result
+```
+
+Never log:
+
+```text
+passwords
+API secrets
+Authorization headers
+entire sensitive payloads
+```
+
+Metrics eventually include:
+
+```text
+events_received_total
+
+event_duplicates_total
+
+jobs_pending
+
+jobs_running
+
+jobs_failed
+
+delivery_latency
+
+HTTP latency
+
+DB query latency
+
+replay_count
+
+rate_limit_rejections
+
+queue_depth
+```
+
+---
+
+# 60. Performance Targets
+
+We should not invent huge targets on day one.
+
+Progressive test targets:
+
+```text
+10 events/sec
+100 events/sec
+1,000 events/sec
+```
+
+Only move upward when measurements identify the bottleneck.
+
+The aim is not:
+
+> claim one million requests/sec.
+
+The aim is:
+
+> understand precisely why throughput is what it is.
+
+For every benchmark we record:
+
+```text
+CPU
+memory
+requests/sec
+P50
+P95
+P99
+errors
+database load
+queue depth
+```
+
+---
+
+# 61. API Compatibility
+
+At `v0.x`, breaking API changes are allowed.
+
+Starting at `v1.0`:
+
+```text
+/v1/...
+```
+
+becomes the stable public namespace.
+
+Future incompatible API work becomes:
+
+```text
+/v2/...
+```
+
+Database schema version and API version are independent.
+
+---
+
+# 62. Architectural Decision Records
+
+Important engineering decisions should be recorded under:
+
+```text
+docs/adr/
+```
+
+Example:
+
+```text
+ADR-001 PostgreSQL as primary metadata database
+
+ADR-002 Modular monolith before microservices
+
+ADR-003 At-least-once execution semantics
+
+ADR-004 C17 baseline
+
+ADR-005 C++20 data plane
+
+ADR-006 PostgreSQL queue before external broker
+
+ADR-007 Immutable events
+
+ADR-008 Local-first C event store
+
+ADR-009 Payload archival outside PostgreSQL
+
+ADR-010 No arbitrary workflow code in v1
+```
+
+This teaches an important professional habit:
+
+> Document why a system was designed a certain way, not only what the code currently does.
+
+---
+
+# 63. Why We Initially Use PostgreSQL as the Queue
+
+We could immediately add:
+
+```text
+Kafka
+RabbitMQ
+Redis
+NATS
+```
+
+but that would introduce extra infrastructure before we understand queue semantics.
+
+PostgreSQL already gives us:
+
+```text
+transactions
+locking
+persistence
+SKIP LOCKED
+indexes
+timestamps
+```
+
+which is sufficient for our initial workload.
+
+Only introduce a dedicated broker when measurements demonstrate a need.
+
+---
+
+# 64. Why No Kubernetes Initially
+
+Kubernetes solves deployment/orchestration problems.
+
+It does not teach us:
+
+```text
+why retries duplicate work
+why transactions fail
+why queues back up
+why sockets block
+why memory gets corrupted
+```
+
+Docker Compose locally and simple containers publicly are enough.
+
+Kubernetes can become a later deployment exercise after EventForge itself exists.
+
+---
+
+# 65. CI Pipeline
+
+Every push:
+
+```text
+Git push
+   │
+   ▼
+GitHub Actions
+   │
+   ├── Python lint
+   ├── Python tests
+   ├── Python type check
+   │
+   ├── C build
+   ├── C tests
+   ├── C sanitizer build
+   │
+   ├── C++ build
+   ├── C++ tests
+   ├── C++ sanitizer build
+   │
+   ├── frontend test/build
+   │
+   ├── PostgreSQL migrations
+   │
+   ├── integration test
+   │
+   └── deployment build
+```
+
+On tagged releases:
+
+```text
+v0.7.0
+```
+
+CI produces container images and release artifacts.
+
+---
+
+# 66. Deployment Stages
+
+## Stage A — Completely local
+
+```text
+localhost only
+```
+
+No cloud dependency.
+
+## Stage B — Public frontend
+
+GitHub Pages hosts the frontend.
+
+Backend remains local/test.
+
+## Stage C — Public API
+
+Python API moves to hosted compute.
+
+Database moves to managed PostgreSQL.
+
+## Stage D — C++ gateway
+
+C++ runtime is deployed publicly.
+
+## Stage E — Object archive
+
+Large payloads move to object storage.
+
+## Stage F — Edge buffering if needed
+
+Add Cloudflare Worker/Queue.
+
+## Stage G — Domain and production-quality hardening
+
+Optional custom domain and stronger infrastructure.
+
+---
+
+# 67. Development Order at a Glance
+
+```text
+v0.0
+Foundation
+   │
+   ▼
+v0.1
+HookLedger
+   │
+   ▼
+v0.2
+Reliable queue/retries
+   │
+   ▼
+v0.3
+ReplayDB
+   │
+   ▼
+v0.4
+FlowTrace
+   │
+   ▼
+v0.5
+TracePocket
+   │
+   ▼
+v0.6
+QuotaGate / C++
+   │
+   ▼
+v0.7
+C Event Store
+   │
+   ▼
+v0.8
+FaultMesh
+   │
+   ▼
+v0.9
+ChangeWire
+   │
+   ▼
+v0.10
+DriftLens
+   │
+   ▼
+v0.11
+SyncForge
+   │
+   ▼
+v0.12
+MigrationSentinel
+   │
+   ▼
+v1.0
+Public stable release
+```
+
+---
+
+# 68. Engineering Role Progression
+
+Although one person builds it, you deliberately wear different engineering hats.
+
+| Version | Engineering role being trained |
+| ------- | ------------------------------ |
+| 0.0     | Build/release engineer         |
+| 0.1     | Backend/API engineer           |
+| 0.2     | Distributed-systems engineer   |
+| 0.3     | Storage/reliability engineer   |
+| 0.4     | Automation/platform engineer   |
+| 0.5     | Observability engineer         |
+| 0.6     | C++ network engineer           |
+| 0.7     | C systems/storage engineer     |
+| 0.8     | Network resilience engineer    |
+| 0.9     | Database/CDC engineer          |
+| 0.10    | API/platform engineer          |
+| 0.11    | Integration engineer           |
+| 0.12    | Database reliability engineer  |
+| 1.0     | SRE/release/security engineer  |
+
+---
+
+# 69. What Makes This a Serious Portfolio Project
+
+The final repository should let an interviewer inspect:
+
+```text
+C
+C++
+Python
+SQL
+TypeScript
+
+Linux APIs
+networking
+HTTP
+concurrency
+memory ownership
+file formats
+
+PostgreSQL
+transactions
+locking
+indexes
+
+REST API design
+webhooks
+authentication
+
+background jobs
+retries
+idempotency
+
+distributed-system failures
+
+observability
+tracing
+
+CI/CD
+containers
+
+security
+load testing
+failure testing
+
+technical documentation
+architectural decisions
+```
+
+More importantly, the components have reasons to exist.
+
+The C code isn't present just to say:
+
+> used C.
+
+The C code implements low-level storage.
+
+The C++ code isn't present just to say:
+
+> used C++.
+
+The C++ code handles the high-performance data plane.
+
+Python isn't being used merely because it is easy.
+
+Python operates the control plane where flexibility is valuable.
+
+---
+
+# 70. What We Should Not Build
+
+For the first major release, explicitly exclude:
+
+```text
+Kubernetes
+
+Kafka cluster
+
+arbitrary user code execution
+
+billing
+
+enterprise organization management
+
+hundreds of SaaS connectors
+
+mobile app
+
+AI features
+
+full Datadog replacement
+
+full Temporal replacement
+
+full Kong/Envoy replacement
+
+custom distributed consensus
+
+our own SQL database
+```
+
+Those would destroy the learning focus.
+
+---
+
+# 71. Open-Source Strategy
+
+Recommended license:
+
+```text
+Apache License 2.0
+```
+
+because this is infrastructure/software tooling and Apache 2.0 includes an explicit patent-license framework.
+
+Repository should eventually contain:
+
+```text
+LICENSE
+README.md
+ARCHITECTURE.md
+SECURITY.md
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md
+CHANGELOG.md
+```
+
+Documentation should explain both:
+
+```text
+how to use EventForge
+```
+
+and:
+
+```text
+how EventForge works internally
+```
+
+---
+
+# 72. Final Architecture at v1.x
+
+```text
+                         USER
+                           │
+                           ▼
+                    GitHub Pages
+                    React frontend
+                           │
+                           │ HTTPS
+                           ▼
+                ┌────────────────────┐
+                │ Python Control API │
+                │                    │
+                │ projects           │
+                │ configuration      │
+                │ workflows          │
+                │ query API          │
+                └─────────┬──────────┘
+                          │
+                          │
+                          ▼
+                     PostgreSQL
+                          ▲
+                          │
+                          │
+             ┌────────────┴─────────────┐
+             │                          │
+             ▼                          ▼
+      C++ Gateway/Executor          C Event Library
+             │                          │
+       ┌─────┼─────┐                    │
+       │     │     │                    │
+       ▼     ▼     ▼                    │
+     Rate  Replay Fault                Log
+     limit engine Mesh               format
+       │
+       ▼
+     Internet APIs
+
+
+External systems
+       │
+       ▼
+Webhook endpoint
+       │
+       ▼
+Gateway
+       │
+       ▼
+Durable event
+       │
+       ▼
+Job
+       │
+       ▼
+Workflow
+       │
+       ▼
+Side effect
+       │
+       ▼
+Trace/history
+       │
+       ▼
+Replay/debug
+```
+
+Later optional:
+
+```text
+Internet
+    │
+Cloudflare edge
+    │
+durable queue
+    │
+EventForge
+```
+
+---
+
+# 73. Final Answer to “Laptop First or Web First?”
+
+**Laptop first.**
+
+But not laptop forever.
+
+The progression is:
+
+```text
+BUILD locally
+   ↓
+TEST locally
+   ↓
+BREAK locally
+   ↓
+FIX locally
+   ↓
+CONTAINERIZE
+   ↓
+DEPLOY stable component
+   ↓
+TEST through real Internet
+   ↓
+observe problems
+   ↓
+improve architecture
+```
+
+That is much better than writing code directly inside random cloud dashboards.
+
+The laptop is our engineering laboratory.
+
+The Internet is our real-world integration environment.
+
+The cloud is our deployment environment.
+
+They serve different purposes.
+
+---
+
+# 74. Current Free Infrastructure Baseline
+
+As of 23 September 2026, the plan can plausibly operate at learning/public-demo scale for $0 using:
+
+| Requirement            | Service            | Current useful free allowance            |
+| ---------------------- | ------------------ | ---------------------------------------- |
+| Source control         | GitHub             | Public repository                        |
+| CI                     | GitHub Actions     | Standard runners free for public repos   |
+| Frontend               | GitHub Pages       | 100 GB/month soft bandwidth              |
+| Application compute    | Northflank Sandbox | 2 services, 1 DB, 2 cron jobs, always-on |
+| PostgreSQL alternative | Supabase           | 500 MB database                          |
+| Payload archive        | Cloudflare R2      | 10 GB-month                              |
+| Edge later             | Cloudflare Workers | 100k requests/day                        |
+| Queue later            | Cloudflare Queues  | 10k operations/day, 24h retention        |
+| Fallback compute       | Render             | 750 free instance hours, but sleeps      |
+
+These services are appropriate for development, education and public demonstration—not an industrial SLA.
+
+Free-tier rules can change, so infrastructure adapters and documentation must prevent the project from depending permanently on one vendor.
+
+---
+
+# 75. Official Source Baseline
+
+GitHub Pages limits: [GitHub Pages limits documentation](https://docs.github.com/en/pages/getting-started-with-github-pages/github-pages-limits?utm_source=chatgpt.com)
+
+GitHub Actions usage/billing: [GitHub Actions billing documentation](https://docs.github.com/en/billing/concepts/product-billing/github-actions?utm_source=chatgpt.com)
+
+GitHub webhook reliability recommendations: [GitHub webhook best practices](https://docs.github.com/en/webhooks/using-webhooks/best-practices-for-using-webhooks?utm_source=chatgpt.com)
+
+PostgreSQL 18 documentation: [PostgreSQL 18 documentation](https://www.postgresql.org/docs/18/?utm_source=chatgpt.com)
+
+PostgreSQL logical replication: [PostgreSQL logical replication documentation](https://www.postgresql.org/docs/18/logical-replication.html?utm_source=chatgpt.com)
+
+Python releases: [Python 3.14 releases](https://www.python.org/doc/versions/?utm_source=chatgpt.com)
+
+FastAPI deployment documentation: [FastAPI deployment documentation](https://fastapi.tiangolo.com/deployment/?utm_source=chatgpt.com)
+
+OpenTelemetry concepts: [OpenTelemetry signals documentation](https://opentelemetry.io/docs/concepts/signals/?utm_source=chatgpt.com)
+
+Supabase pricing: [Supabase pricing and free limits](https://supabase.com/pricing?utm_source=chatgpt.com)
+
+Cloudflare Workers: [Cloudflare Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/?utm_source=chatgpt.com)
+
+Cloudflare Queues: [Cloudflare Queues pricing](https://developers.cloudflare.com/queues/platform/pricing/?utm_source=chatgpt.com)
+
+Cloudflare R2: [Cloudflare R2 pricing](https://developers.cloudflare.com/r2/pricing/?utm_source=chatgpt.com)
+
+Northflank: [Northflank pricing](https://northflank.com/pricing?utm_source=chatgpt.com)
+
+Render fallback: [Render free-service documentation](https://render.com/docs/free?utm_source=chatgpt.com)
+
+---
+
+# 76. Engineering Definition of Success
+
+EventForge succeeds even if it never becomes a commercial product.
+
+The project succeeds if, by building it, its engineer can confidently explain and demonstrate:
+
+```text
+what happens when an HTTP request reaches Linux
+
+how data becomes durable
+
+why database transactions matter
+
+how queues prevent request blocking
+
+why duplicate messages happen
+
+why exactly-once is difficult
+
+how retries can make outages worse
+
+how rate limiting works mathematically
+
+how multiple workers coordinate
+
+how memory and ownership work in C/C++
+
+how file formats survive crashes
+
+how APIs evolve
+
+how distributed requests are traced
+
+how applications synchronize conflicting data
+
+how database changes become events
+
+how deployments differ from development
+
+how production systems are tested by intentionally breaking them
+```
+
+That is the real objective of EventForge.
+
+**EventForge is not ten portfolio projects placed beside each other.**
+
+It is one evolving engineering system in which each new module exists because the previous version creates a new real-world problem worth solving.
