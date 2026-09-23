@@ -12,4 +12,6 @@ cmake-build-*/
 *.a
 *.so
 .DS_Store
+.env.production
+backups/
 *.zip

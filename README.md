@@ -1,107 +1,81 @@
-# EventForge v0.8.0 — Reliability and Recovery Hardening
+# EventForge v0.9.0 — Public Deployment Release Candidate
 
-EventForge v1.0 remains limited to the same three user-facing products:
+EventForge v1.0 remains intentionally limited to three user-facing products:
 
 ```text
-HookLedger  -> receive and persist events
+HookLedger  -> receive and durably process webhooks/events
 ReplayDB    -> replay immutable historical events
 FlowTrace   -> execute durable structured workflows
 ```
 
-v0.8.0 does **not** add a fourth product. It hardens the shared PostgreSQL job
-runtime against worker crashes, lease expiry, retry/recovery races, and
-concurrent duplicate ingress.
+v0.9.0 does not add a fourth product. It packages the v0.8 reliability-hardened
+system for a real public release-candidate deployment.
 
-## Reliability additions
+## v0.9 additions
 
-### Worker lease heartbeat
+- production-only Docker Compose topology;
+- Caddy HTTPS/reverse-proxy edge;
+- static React production build served by Nginx;
+- same-origin browser control API under `/api`;
+- production secret generator that does not print secrets;
+- provider-independent production smoke test;
+- on-demand PostgreSQL backup profile;
+- public release-candidate gates and ADR.
 
-A claimed job now records `last_heartbeat_at`. While its handler is running, the
-worker periodically renews the same lease token. Defaults:
+The frozen v0.8 reliability baseline includes the lease-clock freshness fix and
+39 backend tests.
 
-```text
-lease:      30 seconds
-heartbeat:  10 seconds
-```
-
-The interval is configurable with `EVENTFORGE_JOB_HEARTBEAT_SECONDS` and must be
-shorter than the lease duration.
-
-### Recovery audit metadata
-
-Jobs now retain:
-
-```text
-recovery_count
-last_recovered_at
-```
-
-Expired leases still follow the existing attempt budget: they return to the
-retry path when attempts remain or become dead-lettered when the budget is
-exhausted.
-
-### Queue health projection
-
-```text
-GET /projects/{project_id}/queue-health
-```
-
-returns project-scoped counts for pending, running, retry-wait, success,
-dead-lettered, expired leases, recovered jobs, total recoveries, the newest
-running heartbeat, and the age of the oldest actionable job.
-
-The v0.7 Overview dashboard now includes this reliability state.
-
-### Explicit recovery pass
-
-Administrators can trigger one bounded pass with:
-
-```text
-POST /operations/recover-jobs
-```
-
-It recovers expired leases and promotes due retries. Project API keys cannot use
-the global operations route.
-
-## Failure and load validation
-
-The canonical isolated test command is:
+## Development mode
 
 ```bat
+docker compose up -d --build
 docker compose run --rm --build test
 ```
 
-v0.8 contains 38 API tests. New coverage includes lease renewal, recovery audit
-metadata, queue-health authorization, administrator recovery, and eight-way
-concurrent duplicate ingress proving one immutable event and one
-`PROCESS_EVENT` job are created for one delivery identity.
+Expected: `39 passed`.
 
-Two temporary-project probes are also available:
+Development stays on `http://localhost:5173` (web) and
+`http://localhost:8000` (API).
+
+## Local production-mode staging
 
 ```bat
-docker compose --profile reliability run --rm --build recovery-probe
-docker compose --profile reliability run --rm --build load-probe
+docker run --rm -v "%cd%:/repo" -w /repo python:3.14.7-slim python tools/generate_production_env.py --host http://localhost
+docker compose --env-file .env.production -f compose.production.yaml config > NUL
+docker compose --env-file .env.production -f compose.production.yaml up -d --build
+docker run --rm -v "%cd%:/repo" -w /repo python:3.14.7-slim python tools/production_smoke.py --base-url http://host.docker.internal:8080
+
+The smoke tool automatically sends `Host: localhost` for this local Docker-to-Windows path so Caddy matches the local staging site.
 ```
 
-The load probe defaults to 200 unique ingests at concurrency 20 plus a
-20-request duplicate burst, then waits for the queue to drain. Both probes
-delete their temporary project before exiting.
+## Public paths
+
+```text
+https://eventforge.example.com/           dashboard
+https://eventforge.example.com/api/       control API
+https://eventforge.example.com/ingest     webhook ingress
+https://eventforge.example.com/ready      readiness
+https://eventforge.example.com/docs       API docs
+```
+
+Only the edge proxy should publish host ports.
+
+## Release documentation
+
+Read `DEPLOYMENT.md`, `RELEASE_CANDIDATE.md`, `UPGRADE_V0.9.md`,
+`RELIABILITY.md`, `SECURITY.md`, and ADR-012.
+
+Do not tag v0.9.0 until local production-mode validation, public HTTPS smoke,
+and a signed public webhook delivery all pass.
 
 ## API identity
 
 ```json
-{"name":"EventForge","version":"0.8.0","status":"reliability-hardened"}
+{"name":"EventForge","version":"0.9.0","status":"release-candidate"}
 ```
 
-## Delivery guarantee boundary
+## Boundaries
 
-The internal queue is durable and lease-based, but EventForge still does not
-claim exactly-once external side effects. A remote HTTP action can succeed just
-before a worker crashes and before local success is committed. Integrations
-should use destination-side idempotency where supported.
-
-## Milestone boundary
-
-v0.8 is reliability hardening for HookLedger, ReplayDB, and FlowTrace only.
-Deployment packaging, public hosting, production secrets, reverse proxy/TLS,
-and the release-candidate process remain v0.9 work.
+Production forces signed webhooks and strict public-only HTTPS targets for
+FlowTrace HTTP actions. v0.9 still has one administrator Basic credential, not
+multi-user IAM/RBAC. External HTTP effects remain at-least-once.

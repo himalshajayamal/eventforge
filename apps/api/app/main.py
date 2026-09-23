@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.9.0"
 
 from app.db import db_connect
 from app.jobs import promote_due_retries, recover_expired_leases
@@ -34,7 +34,7 @@ MAX_INGEST_BYTES = int(os.getenv("EVENTFORGE_MAX_INGEST_BYTES", "1048576"))
 app = FastAPI(
     title="EventForge Control API",
     version=APP_VERSION,
-    description="v0.8 reliability-hardened HookLedger + ReplayDB + FlowTrace platform",
+    description="v0.9 release-candidate HookLedger + ReplayDB + FlowTrace platform",
 )
 
 app.add_middleware(
@@ -138,7 +138,7 @@ def root() -> dict[str, str]:
     return {
         "name": "EventForge",
         "version": APP_VERSION,
-        "status": "reliability-hardened",
+        "status": "release-candidate",
     }
 
 

@@ -10,7 +10,7 @@ behavior across real Docker process boundaries.
 docker compose run --rm --build test
 ```
 
-Expected: `38 passed`.
+Expected on the v0.9 branch: `39 passed`.
 
 ## Gate B — recovery probe
 

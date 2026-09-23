@@ -1,0 +1,29 @@
+{$EVENTFORGE_PUBLIC_HOST} {
+    encode zstd gzip
+
+    header {
+        -Server
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    }
+
+    @api_root path /api
+    redir @api_root /api/ 308
+
+    @direct_api path /ingest /ingest/* /health /ready /openapi.json /docs /docs/* /redoc
+    handle @direct_api {
+        reverse_proxy api:8000
+    }
+
+    handle_path /api/* {
+        reverse_proxy api:8000
+    }
+
+    handle {
+        header Content-Security-Policy "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'"
+        reverse_proxy web:80
+    }
+}

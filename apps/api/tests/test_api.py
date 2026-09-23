@@ -134,8 +134,8 @@ def test_health() -> None:
 def test_root_version() -> None:
     response = client.get("/")
     assert response.status_code == 200
-    assert response.json()["version"] == "0.8.0"
-    assert response.json()["status"] == "reliability-hardened"
+    assert response.json()["version"] == "0.9.0"
+    assert response.json()["status"] == "release-candidate"
 
 
 def test_control_plane_requires_authentication() -> None:
