@@ -37,9 +37,15 @@ app = FastAPI(
     description="v0.9 release-candidate HookLedger + ReplayDB + FlowTrace platform",
 )
 
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("EVENTFORGE_CORS_ORIGINS", "http://localhost:5173").split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],

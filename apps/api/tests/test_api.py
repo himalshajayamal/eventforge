@@ -138,6 +138,19 @@ def test_root_version() -> None:
     assert response.json()["status"] == "release-candidate"
 
 
+def test_cors_preflight_allows_local_frontend() -> None:
+    response = client.options(
+        "/projects",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "Authorization",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+
+
 def test_control_plane_requires_authentication() -> None:
     response = client.post("/projects", json={"name": "unauthorized"})
     assert response.status_code == 401

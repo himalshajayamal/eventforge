@@ -1,0 +1,20 @@
+FROM python:3.14.7-slim
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY apps/api/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY apps/api/app ./app
+COPY apps/api/render_migrate.sh ./render_migrate.sh
+COPY database/migrations ./migrations
+
+RUN chmod 0555 /app/render_migrate.sh
+
+EXPOSE 10000
+
+CMD ["python", "-m", "app.render_runtime"]
